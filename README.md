@@ -1,3 +1,3 @@
 # VintaSend SQLAlchemy
 
-    SQLAlchemy implementations for VintaSend
+SQLAlchemy implementations for VintaSend
