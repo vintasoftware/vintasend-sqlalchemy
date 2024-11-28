@@ -1,5 +1,5 @@
 import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Generic, TypeVar
 import uuid
 from collections.abc import Iterable
 
@@ -21,10 +21,12 @@ from vintasend.services.dataclasses import (
 from vintasend.services.notification_backends.base import BaseNotificationBackend
 
 if TYPE_CHECKING:
-    from vintasend_sqlalchemy.model_factory import NotificationMixin as NotificationModel
+    from vintasend_sqlalchemy.model_factory import NotificationMixin
 
 
-class SQLAlchemyNotificationBackend(BaseNotificationBackend):
+NotificationModel = TypeVar("NotificationModel", bound="NotificationMixin")
+
+class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotificationBackend):
     session: sessionmaker[Session]
     notification_model_cls: "type[NotificationModel]"
 
@@ -254,13 +256,11 @@ class SQLAlchemyNotificationBackend(BaseNotificationBackend):
         return self.serialize_notification(notification_instance)
 
     def filter_all_in_app_unread_notifications(
-        self, user_id: int | str | uuid.UUID, page: int, page_size: int
+        self, user_id: int | str | uuid.UUID
     ) -> Iterable[Notification]:
         with self.session_manager.begin() as session:
             query = (
                 self._get_all_in_app_unread_notifications_query(session, user_id)
-                .offset((page - 1) * page_size)
-                .limit(page_size)
             )
             notifications = query.all()
         return (self.serialize_notification(notification) for notification in notifications)
@@ -307,7 +307,7 @@ class SQLAlchemyNotificationBackend(BaseNotificationBackend):
             session.expunge_all()
         return (self.serialize_notification(notification) for notification in notifications)
 
-    def get_user_email_from_notification(self, notification_id: int | str | uuid.UUID) -> str | None:
+    def get_user_email_from_notification(self, notification_id: int | str | uuid.UUID) -> str:
         with self.session_manager.begin() as session:
             notification = (
                 session.query(self.notification_model_cls)
