@@ -1,11 +1,11 @@
 from sqlalchemy import String, BigInteger, Integer
-from sqlalchemy.orm import Mapped, mapped_column, declarative_base
+from sqlalchemy.orm import Mapped, mapped_column, DeclarativeBase, relationship
 
-from vintasend_sqlalchemy.model_factory import create_notification_model
+from vintasend_sqlalchemy.model_factory import GenericNotification, NotificationMeta
 
 
-Base = declarative_base()
-metadata = Base.metadata
+class Base(DeclarativeBase):
+    pass
 
 
 class User(Base):
@@ -14,9 +14,13 @@ class User(Base):
     email: Mapped[str] = mapped_column("email", String(255), nullable=False)
 
 
-BaseNotification = create_notification_model(User, "id", BigInteger)
 
-
-class Notification(BaseNotification):
+class Notification(
+    GenericNotification[User, int], 
+    metaclass=NotificationMeta, 
+    user_model=User, 
+    user_primary_key_field_name="id", 
+    user_primary_key_field_type=int
+):
     def get_user_email(self) -> str:
         return self.get_user().email

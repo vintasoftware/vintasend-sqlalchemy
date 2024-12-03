@@ -31,6 +31,10 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
     notification_model_cls: "type[NotificationModel]"
 
     def __init__(self, session: sessionmaker[Session], notification_model_cls: "type[NotificationModel]") -> None:
+        self.backend_kwargs = {
+            "session": session,
+            "notification_model_cls": notification_model_cls,
+        }
         self.session_manager = session
         self.notification_model_cls = (
             notification_model_cls if notification_model_cls else self._get_notification_model_cls()

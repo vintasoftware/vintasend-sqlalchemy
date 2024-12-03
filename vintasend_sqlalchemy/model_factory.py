@@ -1,14 +1,17 @@
 import datetime
 import uuid
-from typing import Any, TypeVar, Generic, overload
+from typing import Any, Callable, TypeVar, Generic
 
 from sqlalchemy import JSON, UUID, DateTime, ForeignKey, Integer, BigInteger, String
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, declarative_base
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm.decl_api import DeclarativeAttributeIntercept
 
-Base = declarative_base()
+class Base(DeclarativeBase):
+    pass
+    
 
 class NotificationMixin(Base):
-    __tablename__ = "notifications"
+    __abstract__ = True
     id: Mapped[int] = mapped_column("id", BigInteger().with_variant(Integer, "sqlite"), primary_key=True)  # noqa: A003
     notification_type: Mapped[str] = mapped_column("notification_type", String(50), nullable=False)
     title: Mapped[str] = mapped_column("title", String(255), nullable=False)
@@ -57,76 +60,52 @@ class NotificationMixin(Base):
 
 
 UserType = TypeVar('UserType', bound=DeclarativeBase)
-UserPrimaryKeyType = TypeVar('UserPrimaryKeyType', type[Integer], type[BigInteger], type[String], type[UUID])
-UserMappedPrimaryKeyType = TypeVar('UserMappedPrimaryKeyType')
+UserPrimaryKeyType = TypeVar('UserPrimaryKeyType', int, str, uuid.UUID)
 
 
-class UserIdTypeMappingMetaClass(type):
-    @overload
-    def __getitem__(cls, user_id_type: type[Integer]) -> type[int]: ...
-    @overload
-    def __getitem__(cls, user_id_type: type[BigInteger]) -> type[int]: ...
-    @overload
-    def __getitem__(cls, user_id_type: type[String]) -> type[str]: ...
-    @overload
-    def __getitem__(cls, user_id_type: type[UUID]) -> type[uuid.UUID]: ...
-    def __getitem__(cls, user_id_type: type) -> type:
-        types_mapping = {
-            String: str,
-            Integer: int,
-            BigInteger: int,
-            UUID: uuid.UUID,
-        }
-        return types_mapping.get(user_id_type, int)
+class NotificationMeta(DeclarativeAttributeIntercept):
+    def __new__(cls, name, bases, dct, user_model, user_primary_key_field_name, user_primary_key_field_type):
+        if user_primary_key_field_type == int:
+            dct['user_id'] = mapped_column(ForeignKey(getattr(user_model, user_primary_key_field_name)))
+            dct['set_user_id'] = lambda self, user_id: setattr(self, 'user_id', user_id)
+        elif user_primary_key_field_type == str:
+            dct['user_id'] = mapped_column(ForeignKey(getattr(user_model, user_primary_key_field_name)))
+            dct['set_user_id'] = lambda self, user_id: setattr(self, 'user_id', user_id)
+        elif user_primary_key_field_type == uuid.UUID:
+            dct['user_id'] = mapped_column(ForeignKey(getattr(user_model, user_primary_key_field_name)))
+            dct['set_user_id'] = lambda self, user_id: setattr(self, 'user_id', user_id)
+        
+        dct['user'] = relationship(user_model, backref="notifications")
+        dct['get_user_id'] = lambda self: self.user_id
+        dct['get_user'] = lambda self: self.user
+        dct['__tablename__'] = "notifications"
+        dct['__tableargs__'] = {"extend_existing": True}
+        
+        return super().__new__(cls, name, bases, dct)
+
+
+class GenericNotification(
+    NotificationMixin, 
+    Generic[UserType, UserPrimaryKeyType],     
+):
+    __abstract__ = True
+
+    user: Mapped[UserType]
+    user_id: Mapped[UserPrimaryKeyType]
     
-class UserIdTypeMapping(Generic[UserPrimaryKeyType], metaclass=UserIdTypeMappingMetaClass):
-    pass
-
-
-class GenericNotification(NotificationMixin, Generic[UserType, UserMappedPrimaryKeyType]):
-    def get_user(self) -> UserType:
-        raise NotImplementedError
-
     def get_user_id(self) -> UserPrimaryKeyType:
         raise NotImplementedError
 
-    def set_user_id(self, user_id: UserPrimaryKeyType):
+    def set_user_id(self, user_id: UserPrimaryKeyType) -> None:
+        raise NotImplementedError
+    
+    def get_user(self) -> UserType:
         raise NotImplementedError
 
+    @staticmethod
+    def get_user_id_attr_name() -> str:
+        return "user_id"
 
-def create_notification_model(
-    user_model: type[UserType], 
-    user_primary_key_field_name: str,
-    user_primary_key_field_type: UserPrimaryKeyType
-) -> type[GenericNotification[UserType, UserIdTypeMapping[UserPrimaryKeyType]]]:
-    class Notification(NotificationMixin):
-        __tablename__ = "notifications"
-        __table_args__ = {"extend_existing": True}
-        user_id: Mapped[UserIdTypeMapping[UserPrimaryKeyType]] = mapped_column(
-            ForeignKey(getattr(user_model, user_primary_key_field_name)),
-        )
-        user: Mapped[UserType] = relationship(user_model, back_populates="notifications")
-
-        def get_user(self) -> UserType:
-            return self.user
-
-        def get_user_id(self):
-            return self.user_id
-
-        @staticmethod
-        def get_user_id_attr_name() -> str:
-            return "user_id"
-
-        @staticmethod
-        def get_user_attr_name() -> str:
-            return "user"
-
-        def set_user_id(self, user_id: UserIdTypeMapping[UserPrimaryKeyType]):
-            self.user_id = user_id
-
-    user_model.notifications = relationship(
-        Notification,
-        order_by=Notification.created,
-        back_populates="user",
-    )
-    return Notification
+    @staticmethod
+    def get_user_attr_name() -> str:
+        return "user"

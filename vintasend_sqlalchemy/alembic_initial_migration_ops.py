@@ -1,4 +1,3 @@
-from vintasend_sqlalchemy.model_factory import create_notification_model
 from alembic import op
 import sqlalchemy as sa
 import datetime
