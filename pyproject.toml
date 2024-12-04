@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "vintasend-sqlalchemy"
 version = "0.1.0"
-description = "A flexible package for implementing transactional notifications"
+description = "SQLAlchemy backend implementation for VintaSend"
 authors = ["Hugo bessa <hugo@vinta.com.br>"]
 license = "MIT"
 readme = "README.md"
