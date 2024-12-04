@@ -2,9 +2,7 @@ import datetime
 from unittest import TestCase
 import uuid
 import pytest
-from datetime import timedelta, tzinfo
-
-from unittest.case import TestCase
+from datetime import timedelta
 
 from vintasend.constants import NotificationStatus, NotificationTypes
 from vintasend.exceptions import (
