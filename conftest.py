@@ -60,5 +60,8 @@ def async_db_session(async_db_engine) -> async_sessionmaker[AsyncSession]:
 def cleanup(request):
     """Cleanup a testing directory once we are finished."""
     def remove_test_db():
-        os.remove("test.db")
+        try:
+            os.remove("test.db")
+        except FileNotFoundError:
+            pass
     request.addfinalizer(remove_test_db)
