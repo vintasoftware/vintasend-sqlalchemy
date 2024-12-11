@@ -45,3 +45,5 @@ tmp_email/
 .direnv
 .envrc
 .tool-versions
+
+test.db

@@ -1,28 +1,28 @@
 import asyncio
 import datetime
-from typing import TYPE_CHECKING, Generic, TypeVar
 import uuid
 from collections.abc import Iterable
+from typing import TYPE_CHECKING, Generic, TypeVar
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import NoResultFound
-from sqlalchemy.orm import Session, sessionmaker, joinedload
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
+from sqlalchemy.orm import Session, joinedload, sessionmaker
 from vintasend.app_settings import NotificationSettings
 from vintasend.constants import NotificationStatus, NotificationTypes
 from vintasend.exceptions import (
     NotificationCancelError,
+    NotificationError,
     NotificationNotFoundError,
     NotificationUpdateError,
-    NotificationError,
 )
 from vintasend.services.dataclasses import (
     Notification,
     UpdateNotificationKwargs,
 )
-from vintasend.services.notification_backends.base import BaseNotificationBackend
 from vintasend.services.notification_backends.asyncio_base import AsyncIOBaseNotificationBackend
+from vintasend.services.notification_backends.base import BaseNotificationBackend
+
 
 if TYPE_CHECKING:
     from vintasend_sqlalchemy.model_factory import NotificationMixin

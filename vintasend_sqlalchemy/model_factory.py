@@ -1,10 +1,11 @@
 import datetime
 import uuid
-from typing import Any, Callable, TypeVar, Generic
+from typing import Any, Generic, TypeVar
 
-from sqlalchemy import JSON, UUID, DateTime, ForeignKey, Integer, BigInteger, String
+from sqlalchemy import JSON, BigInteger, DateTime, ForeignKey, Integer, String
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.orm.decl_api import DeclarativeAttributeIntercept
+
 
 class Base(DeclarativeBase):
     pass

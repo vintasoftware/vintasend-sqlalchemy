@@ -1,22 +1,23 @@
 import datetime
-from unittest import TestCase
 import uuid
-import pytest
 from datetime import timedelta
+from unittest import TestCase
 
+import pytest
+from sqlalchemy.orm import Session, sessionmaker
 from vintasend.constants import NotificationStatus, NotificationTypes
 from vintasend.exceptions import (
     NotificationCancelError,
     NotificationNotFoundError,
     NotificationUpdateError,
 )
-from vintasend.services.dataclasses import Notification
+from vintasend.services.dataclasses import Notification, UpdateNotificationKwargs
+
+from example_app.models import Notification as NotificationModel
+from example_app.models import User
 from vintasend_sqlalchemy.services.notification_backends.sqlalchemy_notification_backend import (
     SQLAlchemyNotificationBackend,
 )
-from example_app.models import User, Notification as NotificationModel
-from vintasend.services.dataclasses import UpdateNotificationKwargs
-from sqlalchemy.orm import sessionmaker, Session
 
 
 class SQLAlchemyNotificationBackendTestCase(TestCase):

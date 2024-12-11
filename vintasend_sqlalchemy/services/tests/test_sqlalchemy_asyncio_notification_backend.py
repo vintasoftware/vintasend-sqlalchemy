@@ -1,28 +1,24 @@
-import asyncio
 import datetime
-from typing import Tuple
-from unittest import TestCase, IsolatedAsyncioTestCase
 import uuid
-import pytest
-import pytest_asyncio
 from datetime import timedelta
 
+import pytest
+import pytest_asyncio
 from sqlalchemy import delete
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from vintasend.constants import NotificationStatus, NotificationTypes
 from vintasend.exceptions import (
     NotificationCancelError,
     NotificationNotFoundError,
     NotificationUpdateError,
 )
-from vintasend.services.dataclasses import Notification
+from vintasend.services.dataclasses import Notification, UpdateNotificationKwargs
+
+from example_app.models import Notification as NotificationModel
+from example_app.models import User
 from vintasend_sqlalchemy.services.notification_backends.sqlalchemy_notification_backend import (
     SQLAlchemyAsyncIONotificationBackend,
-    SQLAlchemyNotificationBackend,
 )
-from example_app.models import User, Notification as NotificationModel
-from vintasend.services.dataclasses import UpdateNotificationKwargs
-from sqlalchemy.orm import sessionmaker, Session
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
 @pytest_asyncio.fixture(autouse=True)

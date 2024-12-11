@@ -1,6 +1,7 @@
-from alembic import op
-import sqlalchemy as sa
 import datetime
+
+import sqlalchemy as sa
+from alembic import op
 
 
 def create_notification_table(user_id_type: type):
