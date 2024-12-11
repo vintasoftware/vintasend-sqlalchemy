@@ -4,9 +4,12 @@ import pytest
 import pytest_asyncio
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, delete
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session, sessionmaker
+
+from example_app.models import Notification as NotificationModel
+from example_app.models import User
 
 
 @pytest.fixture(scope="session")
@@ -40,12 +43,16 @@ def setup_db(db_engine):
 
 @pytest_asyncio.fixture(scope="session", autouse=True)
 @pytest.mark.asyncio
-async def setup_async_db(async_db_engine):
+async def setup_async_db(async_db_engine, async_db_session):
     # Run Alembic migrations
     alembic_cfg = Config("alembic.ini")
     command.upgrade(alembic_cfg, "head")
 
     yield
+
+    async with async_db_session.begin() as session:
+        await session.execute(delete(User))
+        await session.execute(delete(NotificationModel))
 
     # Tear down the database after the tests
     await async_db_engine.dispose()
@@ -54,14 +61,3 @@ async def setup_async_db(async_db_engine):
 @pytest.fixture(scope="session", autouse=True)
 def async_db_session(async_db_engine) -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(bind=async_db_engine)
-
-
-@pytest.fixture(scope="session", autouse=True)
-def cleanup(request):
-    """Cleanup a testing directory once we are finished."""
-    def remove_test_db():
-        try:
-            os.remove("test.db")
-        except FileNotFoundError:
-            pass
-    request.addfinalizer(remove_test_db)
