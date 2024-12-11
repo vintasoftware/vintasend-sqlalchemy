@@ -987,13 +987,14 @@ files = []
 develop = false
 
 [package.dependencies]
+pytest-asyncio = "^0.24.0"
 typing-extensions = "^4.12.2"
 
 [package.source]
 type = "git"
 url = "https://github.com/vintasoftware/vintasend.git"
 reference = "main"
-resolved_reference = "4878336e43725ee6d1e2eaa86f4367e86c190093"
+resolved_reference = "5b7074f697da1489b3b0c954a32a1d4cca55ea5d"
 
 [[package]]
 name = "virtualenv"
