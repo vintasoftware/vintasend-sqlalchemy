@@ -1,4 +1,5 @@
 import datetime
+import os
 import uuid
 from datetime import timedelta
 from unittest import TestCase
@@ -28,12 +29,13 @@ class SQLAlchemyNotificationBackendTestCase(TestCase):
             self.user = User(email="foo@example.com")
             session.add(self.user)
             session.flush()
-            self.user_id = self.user.id        
+            self.user_id = self.user.id
 
     def tearDown(self) -> None:
         with self.session.begin() as session:
             session.query(User).delete()
             session.query(NotificationModel).delete()
+            session.flush()
 
     def test_persist_notification(self):
         notification = SQLAlchemyNotificationBackend(self.session, NotificationModel).persist_notification(

@@ -1,11 +1,13 @@
 import os
+
 import pytest
 import pytest_asyncio
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, Session
-from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession, create_async_engine
-from alembic.config import Config
 from alembic import command
+from alembic.config import Config
+from sqlalchemy import create_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import Session, sessionmaker
+
 
 @pytest.fixture(scope="session")
 def db_engine():
@@ -52,3 +54,11 @@ async def setup_async_db(async_db_engine):
 @pytest.fixture(scope="session", autouse=True)
 def async_db_session(async_db_engine) -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(bind=async_db_engine)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def cleanup(request):
+    """Cleanup a testing directory once we are finished."""
+    def remove_test_db():
+        os.remove("test.db")
+    request.addfinalizer(remove_test_db)

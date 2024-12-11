@@ -29,15 +29,16 @@ async def setup_fixture(async_db_session: async_sessionmaker[AsyncSession]):
         await session.flush()
         session.expunge(user)
     yield user
-    async with async_db_session.begin() as session:
-        await session.execute(delete(User))
-        await session.execute(delete(NotificationModel))
 
 @pytest.mark.asyncio
-async def test_persist_notification(async_db_session: async_sessionmaker[AsyncSession], setup_fixture: User):
+async def test_persist_notification(
+    async_db_session: async_sessionmaker[AsyncSession], setup_fixture: User
+):
     user = setup_fixture
     user_id = user.id
-    notification = await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).persist_notification(
+    notification = await SQLAlchemyAsyncIONotificationBackend(
+        async_db_session, NotificationModel
+    ).persist_notification(
         user_id=user_id,
         notification_type=NotificationTypes.EMAIL.value,
         title="test",
@@ -78,11 +79,21 @@ async def test_persist_notification(async_db_session: async_sessionmaker[AsyncSe
         assert notification_db_record.preheader_template == "test"
         assert notification_db_record.status == NotificationStatus.PENDING_SEND.value
 
+    async with async_db_session.begin() as session:
+        await session.execute(
+            delete(NotificationModel).where(NotificationModel.id == notification_id)
+        )
+
+
 @pytest.mark.asyncio
-async def test_update_notification(async_db_session: async_sessionmaker[AsyncSession], setup_fixture: User):
+async def test_update_notification(
+    async_db_session: async_sessionmaker[AsyncSession], setup_fixture: User
+):
     user = setup_fixture
     user_id = user.id
-    notification = await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).persist_notification(
+    notification = await SQLAlchemyAsyncIONotificationBackend(
+        async_db_session, NotificationModel
+    ).persist_notification(
         user_id=user_id,
         notification_type=NotificationTypes.EMAIL.value,
         title="test",
@@ -94,10 +105,10 @@ async def test_update_notification(async_db_session: async_sessionmaker[AsyncSes
         preheader_template="test",
     )
 
-    updated_data: UpdateNotificationKwargs = {
-        "subject_template": "updated test subject"
-    }
-    updated_notification = await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).persist_notification_update(
+    updated_data: UpdateNotificationKwargs = {"subject_template": "updated test subject"}
+    updated_notification = await SQLAlchemyAsyncIONotificationBackend(
+        async_db_session, NotificationModel
+    ).persist_notification_update(
         notification_id=notification.id,
         updated_data=updated_data,
     )
@@ -109,11 +120,21 @@ async def test_update_notification(async_db_session: async_sessionmaker[AsyncSes
         assert notification_db_record is not None
         assert notification_db_record.subject_template == "updated test subject"
 
+    async with async_db_session.begin() as session:
+        await session.execute(
+            delete(NotificationModel).where(NotificationModel.id == notification.id)
+        )
+
+
 @pytest.mark.asyncio
-async def test_get_pending_notifications(async_db_session: async_sessionmaker[AsyncSession], setup_fixture: User):
+async def test_get_pending_notifications(
+    async_db_session: async_sessionmaker[AsyncSession], setup_fixture: User
+):
     user = setup_fixture
     user_id = user.id
-    await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).persist_notification(
+    await SQLAlchemyAsyncIONotificationBackend(
+        async_db_session, NotificationModel
+    ).persist_notification(
         user_id=user_id,
         notification_type=NotificationTypes.EMAIL.value,
         title="test",
@@ -125,7 +146,9 @@ async def test_get_pending_notifications(async_db_session: async_sessionmaker[As
         preheader_template="test",
     )
 
-    await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).persist_notification(
+    await SQLAlchemyAsyncIONotificationBackend(
+        async_db_session, NotificationModel
+    ).persist_notification(
         user_id=user_id,
         notification_type=NotificationTypes.EMAIL.value,
         title="test 2",
@@ -137,7 +160,9 @@ async def test_get_pending_notifications(async_db_session: async_sessionmaker[As
         preheader_template="test 2",
     )
 
-    already_sent = await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).persist_notification(
+    already_sent = await SQLAlchemyAsyncIONotificationBackend(
+        async_db_session, NotificationModel
+    ).persist_notification(
         user_id=user_id,
         notification_type=NotificationTypes.EMAIL.value,
         title="test already sent",
@@ -149,12 +174,16 @@ async def test_get_pending_notifications(async_db_session: async_sessionmaker[As
         preheader_template="test already sent",
     )
 
-    await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).mark_pending_as_sent(
+    await SQLAlchemyAsyncIONotificationBackend(
+        async_db_session, NotificationModel
+    ).mark_pending_as_sent(
         notification_id=already_sent.id,
     )
 
     notifications = list(
-        await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).get_pending_notifications(page=1, page_size=1)
+        await SQLAlchemyAsyncIONotificationBackend(
+            async_db_session, NotificationModel
+        ).get_pending_notifications(page=1, page_size=1)
     )
     assert len(notifications) == 1
     notification_1 = notifications[0]
@@ -171,7 +200,9 @@ async def test_get_pending_notifications(async_db_session: async_sessionmaker[As
     assert notification_1.status == NotificationStatus.PENDING_SEND.value
 
     notifications = list(
-        await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).get_pending_notifications(page=2, page_size=1)
+        await SQLAlchemyAsyncIONotificationBackend(
+            async_db_session, NotificationModel
+        ).get_pending_notifications(page=2, page_size=1)
     )
     assert len(notifications) == 1
     notification_2 = notifications[0]
@@ -187,11 +218,26 @@ async def test_get_pending_notifications(async_db_session: async_sessionmaker[As
     assert notification_2.preheader_template == "test 2"
     assert notification_2.status == NotificationStatus.PENDING_SEND.value
 
+    async with async_db_session.begin() as session:
+        await session.execute(
+            delete(NotificationModel).where(NotificationModel.id == notification_1.id)
+        )
+        await session.execute(
+            delete(NotificationModel).where(NotificationModel.id == notification_2.id)
+        )
+        await session.execute(
+            delete(NotificationModel).where(NotificationModel.id == already_sent.id)
+        )
+
 @pytest.mark.asyncio
-async def test_mark_pending_as_sent(async_db_session: async_sessionmaker[AsyncSession], setup_fixture: User):
+async def test_mark_pending_as_sent(
+    async_db_session: async_sessionmaker[AsyncSession], setup_fixture: User
+):
     user = setup_fixture
     user_id = user.id
-    notification = await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).persist_notification(
+    notification = await SQLAlchemyAsyncIONotificationBackend(
+        async_db_session, NotificationModel
+    ).persist_notification(
         user_id=user_id,
         notification_type=NotificationTypes.EMAIL.value,
         title="test",
@@ -203,18 +249,29 @@ async def test_mark_pending_as_sent(async_db_session: async_sessionmaker[AsyncSe
         preheader_template="test",
     )
 
-    notification = await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).mark_pending_as_sent(notification.id)
+    notification = await SQLAlchemyAsyncIONotificationBackend(
+        async_db_session, NotificationModel
+    ).mark_pending_as_sent(notification.id)
     assert notification.status == NotificationStatus.SENT.value
     async with async_db_session.begin() as session:
         notification_db_record = await session.get(NotificationModel, notification.id)
         assert notification_db_record is not None
         assert notification_db_record.status == NotificationStatus.SENT.value
 
+    async with async_db_session.begin() as session:
+        await session.execute(
+            delete(NotificationModel).where(NotificationModel.id == notification.id)
+        )
+
 @pytest.mark.asyncio
-async def test_mark_pending_as_failed(async_db_session: async_sessionmaker[AsyncSession], setup_fixture: User):
+async def test_mark_pending_as_failed(
+    async_db_session: async_sessionmaker[AsyncSession], setup_fixture: User
+):
     user = setup_fixture
     user_id = user.id
-    notification = await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).persist_notification(
+    notification = await SQLAlchemyAsyncIONotificationBackend(
+        async_db_session, NotificationModel
+    ).persist_notification(
         user_id=user_id,
         notification_type=NotificationTypes.EMAIL.value,
         title="test",
@@ -226,18 +283,29 @@ async def test_mark_pending_as_failed(async_db_session: async_sessionmaker[Async
         preheader_template="test",
     )
 
-    notification = await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).mark_pending_as_failed(notification.id)
+    notification = await SQLAlchemyAsyncIONotificationBackend(
+        async_db_session, NotificationModel
+    ).mark_pending_as_failed(notification.id)
     assert notification.status == NotificationStatus.FAILED.value
     async with async_db_session.begin() as session:
         notification_db_record = await session.get(NotificationModel, notification.id)
         assert notification_db_record is not None
         assert notification_db_record.status == NotificationStatus.FAILED.value
 
+    async with async_db_session.begin() as session:
+        await session.execute(
+            delete(NotificationModel).where(NotificationModel.id == notification.id)
+        )
+
 @pytest.mark.asyncio
-async def test_mark_pending_as_failed_already_sent(async_db_session: async_sessionmaker[AsyncSession], setup_fixture: User):
+async def test_mark_pending_as_failed_already_sent(
+    async_db_session: async_sessionmaker[AsyncSession], setup_fixture: User
+):
     user = setup_fixture
     user_id = user.id
-    notification = await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).persist_notification(
+    notification = await SQLAlchemyAsyncIONotificationBackend(
+        async_db_session, NotificationModel
+    ).persist_notification(
         user_id=user_id,
         notification_type=NotificationTypes.EMAIL.value,
         title="test",
@@ -248,20 +316,33 @@ async def test_mark_pending_as_failed_already_sent(async_db_session: async_sessi
         subject_template="test",
         preheader_template="test",
     )
-    await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).mark_pending_as_sent(notification.id)
+    await SQLAlchemyAsyncIONotificationBackend(
+        async_db_session, NotificationModel
+    ).mark_pending_as_sent(notification.id)
 
     with pytest.raises(NotificationUpdateError):
-        await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).mark_pending_as_failed(notification.id)
+        await SQLAlchemyAsyncIONotificationBackend(
+            async_db_session, NotificationModel
+        ).mark_pending_as_failed(notification.id)
     async with async_db_session.begin() as session:
         notification_db_record = await session.get(NotificationModel, notification.id)
         assert notification_db_record is not None
         assert notification_db_record.status == NotificationStatus.SENT.value
 
+    async with async_db_session.begin() as session:
+        await session.execute(
+            delete(NotificationModel).where(NotificationModel.id == notification.id)
+        )
+
 @pytest.mark.asyncio
-async def test_mark_sent_as_read(async_db_session: async_sessionmaker[AsyncSession], setup_fixture: User):
+async def test_mark_sent_as_read(
+    async_db_session: async_sessionmaker[AsyncSession], setup_fixture: User
+):
     user = setup_fixture
     user_id = user.id
-    notification = await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).persist_notification(
+    notification = await SQLAlchemyAsyncIONotificationBackend(
+        async_db_session, NotificationModel
+    ).persist_notification(
         user_id=user_id,
         notification_type=NotificationTypes.EMAIL.value,
         title="test",
@@ -272,20 +353,33 @@ async def test_mark_sent_as_read(async_db_session: async_sessionmaker[AsyncSessi
         subject_template="test",
         preheader_template="test",
     )
-    await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).mark_pending_as_sent(notification.id)
+    await SQLAlchemyAsyncIONotificationBackend(
+        async_db_session, NotificationModel
+    ).mark_pending_as_sent(notification.id)
 
-    notification = await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).mark_sent_as_read(notification.id)
+    notification = await SQLAlchemyAsyncIONotificationBackend(
+        async_db_session, NotificationModel
+    ).mark_sent_as_read(notification.id)
     assert notification.status == NotificationStatus.READ.value
     async with async_db_session.begin() as session:
         notification_db_record = await session.get(NotificationModel, notification.id)
         assert notification_db_record is not None
         assert notification_db_record.status == NotificationStatus.READ.value
 
+    async with async_db_session.begin() as session:
+        await session.execute(
+            delete(NotificationModel).where(NotificationModel.id == notification.id)
+        )
+
 @pytest.mark.asyncio
-async def test_cancel_notification(async_db_session: async_sessionmaker[AsyncSession], setup_fixture: User):
+async def test_cancel_notification(
+    async_db_session: async_sessionmaker[AsyncSession], setup_fixture: User
+):
     user = setup_fixture
     user_id = user.id
-    notification = await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).persist_notification(
+    notification = await SQLAlchemyAsyncIONotificationBackend(
+        async_db_session, NotificationModel
+    ).persist_notification(
         user_id=user_id,
         notification_type=NotificationTypes.EMAIL.value,
         title="test",
@@ -297,17 +391,28 @@ async def test_cancel_notification(async_db_session: async_sessionmaker[AsyncSes
         preheader_template="test",
     )
 
-    await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).cancel_notification(notification.id)
+    await SQLAlchemyAsyncIONotificationBackend(
+        async_db_session, NotificationModel
+    ).cancel_notification(notification.id)
     async with async_db_session.begin() as session:
         notification_db_record = await session.get(NotificationModel, notification.id)
         assert notification_db_record is not None
         assert notification_db_record.status == NotificationStatus.CANCELLED.value
 
+    async with async_db_session.begin() as session:
+        await session.execute(
+            delete(NotificationModel).where(NotificationModel.id == notification.id)
+        )
+
 @pytest.mark.asyncio
-async def test_cancel_notification_already_sent(async_db_session: async_sessionmaker[AsyncSession], setup_fixture: User):
+async def test_cancel_notification_already_sent(
+    async_db_session: async_sessionmaker[AsyncSession], setup_fixture: User
+):
     user = setup_fixture
     user_id = user.id
-    notification = await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).persist_notification(
+    notification = await SQLAlchemyAsyncIONotificationBackend(
+        async_db_session, NotificationModel
+    ).persist_notification(
         user_id=user_id,
         notification_type=NotificationTypes.EMAIL.value,
         title="test",
@@ -318,21 +423,34 @@ async def test_cancel_notification_already_sent(async_db_session: async_sessionm
         subject_template="test",
         preheader_template="test",
     )
-    await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).mark_pending_as_sent(notification.id)
+    await SQLAlchemyAsyncIONotificationBackend(
+        async_db_session, NotificationModel
+    ).mark_pending_as_sent(notification.id)
 
     with pytest.raises(NotificationCancelError):
-        await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).cancel_notification(notification.id)
+        await SQLAlchemyAsyncIONotificationBackend(
+            async_db_session, NotificationModel
+        ).cancel_notification(notification.id)
 
     async with async_db_session.begin() as session:
         notification_db_record = await session.get(NotificationModel, notification.id)
         assert notification_db_record is not None
         assert notification_db_record.status != NotificationStatus.CANCELLED.value
 
+    async with async_db_session.begin() as session:
+        await session.execute(
+            delete(NotificationModel).where(NotificationModel.id == notification.id)
+        )
+
 @pytest.mark.asyncio
-async def test_get_notification(async_db_session: async_sessionmaker[AsyncSession], setup_fixture: User):
+async def test_get_notification(
+    async_db_session: async_sessionmaker[AsyncSession], setup_fixture: User
+):
     user = setup_fixture
     user_id = user.id
-    notification = await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).persist_notification(
+    notification = await SQLAlchemyAsyncIONotificationBackend(
+        async_db_session, NotificationModel
+    ).persist_notification(
         user_id=user_id,
         notification_type=NotificationTypes.EMAIL.value,
         title="test",
@@ -344,7 +462,9 @@ async def test_get_notification(async_db_session: async_sessionmaker[AsyncSessio
         preheader_template="test",
     )
 
-    notification_retrieved = await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).get_notification(notification.id)
+    notification_retrieved = await SQLAlchemyAsyncIONotificationBackend(
+        async_db_session, NotificationModel
+    ).get_notification(notification.id)
     assert notification_retrieved.id == notification.id
     assert notification_retrieved.user_id == user_id
     assert notification_retrieved.notification_type == NotificationTypes.EMAIL.value
@@ -357,18 +477,30 @@ async def test_get_notification(async_db_session: async_sessionmaker[AsyncSessio
     assert notification_retrieved.preheader_template == "test"
     assert notification_retrieved.status == NotificationStatus.PENDING_SEND.value
 
-@pytest.mark.asyncio
-async def test_get_notification_not_found(async_db_session: async_sessionmaker[AsyncSession], setup_fixture: User):
-    user = setup_fixture
-    user_id = user.id
-    with pytest.raises(NotificationNotFoundError):
-        await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).get_notification(uuid.uuid4())
+    async with async_db_session.begin() as session:
+        await session.execute(
+            delete(NotificationModel).where(NotificationModel.id == notification.id)
+        )
 
 @pytest.mark.asyncio
-async def test_get_notification_cancelled(async_db_session: async_sessionmaker[AsyncSession], setup_fixture: User):
+async def test_get_notification_not_found(
+    async_db_session: async_sessionmaker[AsyncSession], setup_fixture: User
+):
+    with pytest.raises(NotificationNotFoundError):
+        await SQLAlchemyAsyncIONotificationBackend(
+            async_db_session, NotificationModel
+        ).get_notification(uuid.uuid4())
+
+
+@pytest.mark.asyncio
+async def test_get_notification_cancelled(
+    async_db_session: async_sessionmaker[AsyncSession], setup_fixture: User
+):
     user = setup_fixture
     user_id = user.id
-    notification = await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).persist_notification(
+    notification = await SQLAlchemyAsyncIONotificationBackend(
+        async_db_session, NotificationModel
+    ).persist_notification(
         user_id=user_id,
         notification_type=NotificationTypes.EMAIL.value,
         title="test",
@@ -379,7 +511,15 @@ async def test_get_notification_cancelled(async_db_session: async_sessionmaker[A
         subject_template="test",
         preheader_template="test",
     )
-    await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).cancel_notification(notification.id)
+    await SQLAlchemyAsyncIONotificationBackend(
+        async_db_session, NotificationModel
+    ).cancel_notification(notification.id)
     with pytest.raises(NotificationNotFoundError):
-        await SQLAlchemyAsyncIONotificationBackend(async_db_session, NotificationModel).get_notification(notification.id)
+        await SQLAlchemyAsyncIONotificationBackend(
+            async_db_session, NotificationModel
+        ).get_notification(notification.id)
 
+    async with async_db_session.begin() as session:
+        await session.execute(
+            delete(NotificationModel).where(NotificationModel.id == notification.id)
+        )
