@@ -2,7 +2,7 @@ import datetime
 import uuid
 from typing import Any, Generic, TypeVar
 
-from sqlalchemy import JSON, BigInteger, DateTime, ForeignKey, Integer, String
+from sqlalchemy import JSON, BigInteger, DateTime, ForeignKey, Integer, String, null
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.orm.decl_api import DeclarativeAttributeIntercept
 
@@ -33,6 +33,7 @@ class NotificationMixin(Base):
     preheader_template: Mapped[str] = mapped_column("preheader_template", String(255), nullable=True, default="")
     context_name: Mapped[str] = mapped_column("context_name", String(255), nullable=True, default="")
     context_kwargs: Mapped[dict] = mapped_column("context_kwargs", JSON, default=dict)
+    metadata_json: Mapped[dict | None] = mapped_column("metadata_json", JSON, nullable=True)
 
     send_after = mapped_column("send_after", DateTime, nullable=True)
 

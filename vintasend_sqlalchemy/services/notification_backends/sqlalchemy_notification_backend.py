@@ -2,7 +2,7 @@ import asyncio
 import datetime
 import uuid
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import NoResultFound
@@ -30,12 +30,15 @@ if TYPE_CHECKING:
 
 NotificationModel = TypeVar("NotificationModel", bound="NotificationMixin")
 
+
 class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotificationBackend):
     session: sessionmaker[Session]
     notification_model_cls: "type[NotificationModel]"
 
-    def __init__(self, session: sessionmaker[Session], notification_model_cls: "type[NotificationModel]") -> None:
-        super().__init__(session==session, notification_model_cls=notification_model_cls)
+    def __init__(
+        self, session: sessionmaker[Session], notification_model_cls: "type[NotificationModel]"
+    ) -> None:
+        super().__init__(session == session, notification_model_cls=notification_model_cls)
         self.session_manager = session
         self.notification_model_cls = (
             notification_model_cls if notification_model_cls else self._get_notification_model_cls()
@@ -47,8 +50,10 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
             raise NotificationError("Notification model class not set in settings")
 
         return notification_model_cls
-    
-    def _get_all_in_app_unread_notifications_query(self, session: Session, user_id: int | str | uuid.UUID):
+
+    def _get_all_in_app_unread_notifications_query(
+        self, session: Session, user_id: int | str | uuid.UUID
+    ):
         return (
             session.query(self.notification_model_cls)
             .where(
@@ -61,7 +66,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
             )
             .order_by(self.notification_model_cls.created)
         )
-    
+
     def _get_all_future_notifications_query(self, session: Session):
         return (
             session.query(self.notification_model_cls)
@@ -71,8 +76,10 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
             )
             .order_by(self.notification_model_cls.created)
         )
-    
-    def _get_all_future_notifications_from_user_query(self, session: Session, user_id: int | str | uuid.UUID):
+
+    def _get_all_future_notifications_from_user_query(
+        self, session: Session, user_id: int | str | uuid.UUID
+    ):
         return (
             session.query(self.notification_model_cls)
             .where(
@@ -80,7 +87,8 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                 self.notification_model_cls.send_after > datetime.datetime.now(),
                 getattr(
                     self.notification_model_cls, self.notification_model_cls.get_user_id_attr_name()
-                ) == user_id,
+                )
+                == user_id,
             )
             .order_by(self.notification_model_cls.created)
         )
@@ -139,6 +147,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         send_after: datetime.datetime | None,
         subject_template: str | None = None,
         preheader_template: str | None = None,
+        metadata: dict | None = None,
     ) -> Notification:
         with self.session_manager.begin() as session:
             notification_instance = self.notification_model_cls(
@@ -152,6 +161,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                 subject_template=subject_template or "",
                 preheader_template=preheader_template or "",
                 status=NotificationStatus.PENDING_SEND.value,
+                metadata_json=metadata,
             )
             session.add(notification_instance)
             session.flush()
@@ -161,6 +171,12 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
     def persist_notification_update(
         self, notification_id: int | str | uuid.UUID, updated_data: UpdateNotificationKwargs
     ) -> Notification:
+        mapped_updated_data: dict[str, Any] = {
+            k: v for k, v in updated_data.items() if k not in ["metadata"]
+        }
+        if "metadata" in updated_data:
+            mapped_updated_data["metadata_json"] = updated_data["metadata"]
+
         with self.session_manager.begin() as session:
             records_updated = (
                 session.query(self.notification_model_cls)
@@ -168,7 +184,12 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                     self.notification_model_cls.id == notification_id,
                     self.notification_model_cls.status == NotificationStatus.PENDING_SEND.value,
                 )
-                .update({getattr(self.notification_model_cls, k): v for k, v in updated_data.items()})
+                .update(
+                    {
+                        getattr(self.notification_model_cls, k): v
+                        for k, v in mapped_updated_data.items()
+                    }
+                )
             )
             session.commit()
             session.flush()
@@ -176,11 +197,13 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                 raise NotificationUpdateError(
                     "Failed to update notification, it may have already been sent"
                 )
-        
+
         with self.session_manager.begin() as session:
-            notification_instance = session.query(
-                self.notification_model_cls
-            ).filter(self.notification_model_cls.id==notification_id).one()
+            notification_instance = (
+                session.query(self.notification_model_cls)
+                .filter(self.notification_model_cls.id == notification_id)
+                .one()
+            )
             session.flush()
             session.expunge(notification_instance)
 
@@ -190,13 +213,21 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         return self.serialize_notification(notification_instance)
 
     def mark_pending_as_sent(self, notification_id: int | str | uuid.UUID) -> Notification:
-        return self._update_notification_status(notification_id, [NotificationStatus.PENDING_SEND.value], NotificationStatus.SENT.value)
+        return self._update_notification_status(
+            notification_id, [NotificationStatus.PENDING_SEND.value], NotificationStatus.SENT.value
+        )
 
     def mark_pending_as_failed(self, notification_id: int | str | uuid.UUID) -> Notification:
-        return self._update_notification_status(notification_id, [NotificationStatus.PENDING_SEND.value], NotificationStatus.FAILED.value)
+        return self._update_notification_status(
+            notification_id,
+            [NotificationStatus.PENDING_SEND.value],
+            NotificationStatus.FAILED.value,
+        )
 
     def mark_sent_as_read(self, notification_id: int | str | uuid.UUID) -> Notification:
-        return self._update_notification_status(notification_id, [NotificationStatus.SENT.value], NotificationStatus.READ.value)
+        return self._update_notification_status(
+            notification_id, [NotificationStatus.SENT.value], NotificationStatus.READ.value
+        )
 
     def cancel_notification(self, notification_id: int | str | uuid.UUID) -> None:
         with self.session_manager.begin() as session:
@@ -232,7 +263,10 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         return self.serialize_notification(notification_instance)
 
     def _update_notification_status(
-        self, notification_id: int | str | uuid.UUID, expected_current_statuses: list[str], new_status: str
+        self,
+        notification_id: int | str | uuid.UUID,
+        expected_current_statuses: list[str],
+        new_status: str,
     ) -> Notification:
         with self.session_manager.begin() as session:
             records_updated = (
@@ -249,9 +283,11 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                 raise NotificationUpdateError("Failed to update notification status")
 
         with self.session_manager.begin() as session:
-            notification_instance = session.query(
-                self.notification_model_cls
-            ).filter(self.notification_model_cls.id==notification_id).one()
+            notification_instance = (
+                session.query(self.notification_model_cls)
+                .filter(self.notification_model_cls.id == notification_id)
+                .one()
+            )
             session.flush()
             session.expunge(notification_instance)
 
@@ -264,9 +300,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         self, user_id: int | str | uuid.UUID
     ) -> Iterable[Notification]:
         with self.session_manager.begin() as session:
-            query = (
-                self._get_all_in_app_unread_notifications_query(session, user_id)
-            )
+            query = self._get_all_in_app_unread_notifications_query(session, user_id)
             notifications = query.all()
         return (self.serialize_notification(notification) for notification in notifications)
 
@@ -287,7 +321,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
             query = self._get_all_future_notifications_query(session)
             notifications = query.all()
         return (self.serialize_notification(notification) for notification in notifications)
-    
+
     def get_future_notifications(self, page: int, page_size: int) -> Iterable["Notification"]:
         with self.session_manager.begin() as session:
             query = self._get_all_future_notifications_query(session)
@@ -295,16 +329,20 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
             session.flush()
             session.expunge_all()
         return (self.serialize_notification(notification) for notification in notifications)
-    
-    def get_all_future_notifications_from_user(self, user_id: int | str | uuid.UUID) -> Iterable["Notification"]:
+
+    def get_all_future_notifications_from_user(
+        self, user_id: int | str | uuid.UUID
+    ) -> Iterable["Notification"]:
         with self.session_manager.begin() as session:
             query = self._get_all_future_notifications_from_user_query(session, user_id)
             notifications = query.all()
             session.flush()
             session.expunge_all()
         return (self.serialize_notification(notification) for notification in notifications)
-    
-    def get_future_notifications_from_user(self, user_id: int | str | uuid.UUID, page: int, page_size: int) -> Iterable["Notification"]:
+
+    def get_future_notifications_from_user(
+        self, user_id: int | str | uuid.UUID, page: int, page_size: int
+    ) -> Iterable["Notification"]:
         with self.session_manager.begin() as session:
             query = self._get_all_future_notifications_from_user_query(session, user_id)
             notifications = query.offset((page - 1) * page_size).limit(page_size).all()
@@ -316,12 +354,20 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         with self.session_manager.begin() as session:
             notification = (
                 session.query(self.notification_model_cls)
-                .options(joinedload(getattr(self.notification_model_cls, self.notification_model_cls.get_user_attr_name())))
+                .options(
+                    joinedload(
+                        getattr(
+                            self.notification_model_cls,
+                            self.notification_model_cls.get_user_attr_name(),
+                        )
+                    )
+                )
                 .filter(
                     getattr(
                         self.notification_model_cls,
-                        self.notification_model_cls.get_user_id_attr_name()
-                    ) == notification_id
+                        self.notification_model_cls.get_user_id_attr_name(),
+                    )
+                    == notification_id
                 )
                 .one()
             )
@@ -336,8 +382,9 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                 .filter(
                     getattr(
                         self.notification_model_cls,
-                        self.notification_model_cls.get_user_id_attr_name()
-                    ) == notification_id
+                        self.notification_model_cls.get_user_id_attr_name(),
+                    )
+                    == notification_id
                 )
                 .one()
             )
@@ -346,17 +393,23 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
             session.flush()
 
 
-class SQLAlchemyAsyncIONotificationBackend(Generic[NotificationModel], AsyncIOBaseNotificationBackend):
+class SQLAlchemyAsyncIONotificationBackend(
+    Generic[NotificationModel], AsyncIOBaseNotificationBackend
+):
     session: async_sessionmaker[AsyncSession]
     notification_model_cls: "type[NotificationModel]"
 
-    def __init__(self, session: async_sessionmaker[AsyncSession], notification_model_cls: "type[NotificationModel]") -> None:
+    def __init__(
+        self,
+        session: async_sessionmaker[AsyncSession],
+        notification_model_cls: "type[NotificationModel]",
+    ) -> None:
         super().__init__(session=session, notification_model_cls=notification_model_cls)
         self.session_manager = session
         self.notification_model_cls = (
             notification_model_cls if notification_model_cls else self._get_notification_model_cls()
         )
-    
+
     def _get_notification_model_cls(self) -> "type[NotificationModel]":
         notification_model_cls = NotificationSettings().get_notification_model_cls()
         if notification_model_cls is None:
@@ -364,13 +417,16 @@ class SQLAlchemyAsyncIONotificationBackend(Generic[NotificationModel], AsyncIOBa
 
         return notification_model_cls
 
-    def _get_all_in_app_unread_notifications_query(self, session: AsyncSession, user_id: int | str | uuid.UUID):
+    def _get_all_in_app_unread_notifications_query(
+        self, session: AsyncSession, user_id: int | str | uuid.UUID
+    ):
         return (
             select(self.notification_model_cls)
             .where(
                 getattr(
                     self.notification_model_cls, self.notification_model_cls.get_user_id_attr_name()
-                ) == user_id,
+                )
+                == user_id,
                 self.notification_model_cls.status == NotificationStatus.SENT.value,
                 self.notification_model_cls.notification_type == NotificationTypes.IN_APP.value,
             )
@@ -387,7 +443,9 @@ class SQLAlchemyAsyncIONotificationBackend(Generic[NotificationModel], AsyncIOBa
             .order_by(self.notification_model_cls.created)
         )
 
-    def _get_all_future_notifications_from_user_query(self, session: AsyncSession, user_id: int | str | uuid.UUID):
+    def _get_all_future_notifications_from_user_query(
+        self, session: AsyncSession, user_id: int | str | uuid.UUID
+    ):
         return (
             select(self.notification_model_cls)
             .where(
@@ -395,7 +453,8 @@ class SQLAlchemyAsyncIONotificationBackend(Generic[NotificationModel], AsyncIOBa
                 self.notification_model_cls.send_after > datetime.datetime.now(),
                 getattr(
                     self.notification_model_cls, self.notification_model_cls.get_user_id_attr_name()
-                ) == user_id,
+                )
+                == user_id,
             )
             .order_by(self.notification_model_cls.created)
         )
@@ -435,7 +494,9 @@ class SQLAlchemyAsyncIONotificationBackend(Generic[NotificationModel], AsyncIOBa
             notifications = (
                 await session.execute(
                     select(self.notification_model_cls)
-                    .filter(self.notification_model_cls.status == NotificationStatus.PENDING_SEND.value)
+                    .filter(
+                        self.notification_model_cls.status == NotificationStatus.PENDING_SEND.value
+                    )
                     .order_by(self.notification_model_cls.created)
                     .offset((page - 1) * page_size)
                     .limit(page_size)
@@ -454,6 +515,7 @@ class SQLAlchemyAsyncIONotificationBackend(Generic[NotificationModel], AsyncIOBa
         send_after: datetime.datetime | None,
         subject_template: str | None = None,
         preheader_template: str | None = None,
+        metadata: dict | None = None,
         asyncio_lock: asyncio.Lock | None = None,
     ) -> Notification:
         async with self.session_manager() as session:
@@ -468,6 +530,7 @@ class SQLAlchemyAsyncIONotificationBackend(Generic[NotificationModel], AsyncIOBa
                 subject_template=subject_template or "",
                 preheader_template=preheader_template or "",
                 status=NotificationStatus.PENDING_SEND.value,
+                metadata_json=metadata,
             )
             session.add(notification_instance)
             await session.flush()
@@ -477,11 +540,16 @@ class SQLAlchemyAsyncIONotificationBackend(Generic[NotificationModel], AsyncIOBa
         return self.serialize_notification(notification_instance)
 
     async def persist_notification_update(
-        self, 
-        notification_id: int | str | uuid.UUID, 
-        updated_data: UpdateNotificationKwargs, 
+        self,
+        notification_id: int | str | uuid.UUID,
+        updated_data: UpdateNotificationKwargs,
         asyncio_lock: asyncio.Lock | None = None,
     ) -> Notification:
+        mapped_updated_data: dict[str, Any] = {
+            k: v for k, v in updated_data.items() if k not in ["metadata"]
+        }
+        if "metadata" in updated_data:
+            mapped_updated_data["metadata_json"] = updated_data["metadata"]
         async with self.session_manager() as session:
             records_updated = (
                 await session.execute(
@@ -490,7 +558,12 @@ class SQLAlchemyAsyncIONotificationBackend(Generic[NotificationModel], AsyncIOBa
                         self.notification_model_cls.id == notification_id,
                         self.notification_model_cls.status == NotificationStatus.PENDING_SEND.value,
                     )
-                    .values({getattr(self.notification_model_cls, k): v for k, v in updated_data.items()})
+                    .values(
+                        {
+                            getattr(self.notification_model_cls, k): v
+                            for k, v in mapped_updated_data.items()
+                        }
+                    )
                 )
             ).rowcount
             await session.commit()
@@ -498,26 +571,51 @@ class SQLAlchemyAsyncIONotificationBackend(Generic[NotificationModel], AsyncIOBa
                 raise NotificationUpdateError(
                     "Failed to update notification, it may have already been sent"
                 )
-        
+
         async with self.session_manager() as session:
             notification_instance = (
                 await session.execute(
-                    select(self.notification_model_cls)
-                    .where(self.notification_model_cls.id == notification_id)
+                    select(self.notification_model_cls).where(
+                        self.notification_model_cls.id == notification_id
+                    )
                 )
             ).one()[0]
         return self.serialize_notification(notification_instance)
 
-    async def mark_pending_as_sent(self, notification_id: int | str | uuid.UUID, asyncio_lock: asyncio.Lock | None = None,) -> Notification:
-        return await self._update_notification_status(notification_id, [NotificationStatus.PENDING_SEND.value], NotificationStatus.SENT.value)
+    async def mark_pending_as_sent(
+        self,
+        notification_id: int | str | uuid.UUID,
+        asyncio_lock: asyncio.Lock | None = None,
+    ) -> Notification:
+        return await self._update_notification_status(
+            notification_id, [NotificationStatus.PENDING_SEND.value], NotificationStatus.SENT.value
+        )
 
-    async def mark_pending_as_failed(self, notification_id: int | str | uuid.UUID, asyncio_lock: asyncio.Lock | None = None,) -> Notification:
-        return await self._update_notification_status(notification_id, [NotificationStatus.PENDING_SEND.value], NotificationStatus.FAILED.value)
+    async def mark_pending_as_failed(
+        self,
+        notification_id: int | str | uuid.UUID,
+        asyncio_lock: asyncio.Lock | None = None,
+    ) -> Notification:
+        return await self._update_notification_status(
+            notification_id,
+            [NotificationStatus.PENDING_SEND.value],
+            NotificationStatus.FAILED.value,
+        )
 
-    async def mark_sent_as_read(self, notification_id: int | str | uuid.UUID, asyncio_lock: asyncio.Lock | None = None,) -> Notification:
-        return await self._update_notification_status(notification_id, [NotificationStatus.SENT.value], NotificationStatus.READ.value)
+    async def mark_sent_as_read(
+        self,
+        notification_id: int | str | uuid.UUID,
+        asyncio_lock: asyncio.Lock | None = None,
+    ) -> Notification:
+        return await self._update_notification_status(
+            notification_id, [NotificationStatus.SENT.value], NotificationStatus.READ.value
+        )
 
-    async def cancel_notification(self, notification_id: int | str | uuid.UUID, asyncio_lock: asyncio.Lock | None = None,) -> None:
+    async def cancel_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        asyncio_lock: asyncio.Lock | None = None,
+    ) -> None:
         async with self.session_manager() as session:
             records_updated = (
                 await session.execute(
@@ -544,15 +642,16 @@ class SQLAlchemyAsyncIONotificationBackend(Generic[NotificationModel], AsyncIOBa
             if for_update:
                 query = query.with_for_update()
             try:
-                notification_instance = (
-                    await session.execute(query)
-                ).one()[0]
+                notification_instance = (await session.execute(query)).one()[0]
             except NoResultFound as e:
                 raise NotificationNotFoundError("Notification not found") from e
         return self.serialize_notification(notification_instance)
 
     async def _update_notification_status(
-        self, notification_id: int | str | uuid.UUID, expected_current_statuses: list[str], new_status: str
+        self,
+        notification_id: int | str | uuid.UUID,
+        expected_current_statuses: list[str],
+        new_status: str,
     ) -> Notification:
         async with self.session_manager() as session:
             records_updated = (
@@ -572,8 +671,9 @@ class SQLAlchemyAsyncIONotificationBackend(Generic[NotificationModel], AsyncIOBa
         async with self.session_manager() as session:
             notification_instance = (
                 await session.execute(
-                    select(self.notification_model_cls)
-                    .where(self.notification_model_cls.id == notification_id)
+                    select(self.notification_model_cls).where(
+                        self.notification_model_cls.id == notification_id
+                    )
                 )
             ).one()[0]
         return self.serialize_notification(notification_instance)
@@ -602,22 +702,26 @@ class SQLAlchemyAsyncIONotificationBackend(Generic[NotificationModel], AsyncIOBa
             results = await session.execute(query)
             notifications = results.all()
         return (self.serialize_notification(notification[0]) for notification in notifications)
-    
+
     async def get_future_notifications(self, page: int, page_size: int) -> Iterable["Notification"]:
         async with self.session_manager() as session:
             query = self._get_all_future_notifications_query(session)
             results = await session.execute(query.offset((page - 1) * page_size).limit(page_size))
             notifications = results.all()
         return (self.serialize_notification(notification[0]) for notification in notifications)
-    
-    async def get_all_future_notifications_from_user(self, user_id: int | str | uuid.UUID) -> Iterable["Notification"]:
+
+    async def get_all_future_notifications_from_user(
+        self, user_id: int | str | uuid.UUID
+    ) -> Iterable["Notification"]:
         async with self.session_manager() as session:
             query = self._get_all_future_notifications_from_user_query(session, user_id)
             results = await session.execute(query)
             notifications = results.all()
         return (self.serialize_notification(notification[0]) for notification in notifications)
-    
-    async def get_future_notifications_from_user(self, user_id: int | str | uuid.UUID, page: int, page_size: int) -> Iterable["Notification"]:
+
+    async def get_future_notifications_from_user(
+        self, user_id: int | str | uuid.UUID, page: int, page_size: int
+    ) -> Iterable["Notification"]:
         async with self.session_manager() as session:
             query = self._get_all_future_notifications_from_user_query(session, user_id)
             results = await session.execute(query.offset((page - 1) * page_size).limit(page_size))
@@ -629,27 +733,40 @@ class SQLAlchemyAsyncIONotificationBackend(Generic[NotificationModel], AsyncIOBa
             notification = (
                 await session.execute(
                     select(self.notification_model_cls)
-                    .options(joinedload(getattr(self.notification_model_cls, self.notification_model_cls.get_user_attr_name())))
+                    .options(
+                        joinedload(
+                            getattr(
+                                self.notification_model_cls,
+                                self.notification_model_cls.get_user_attr_name(),
+                            )
+                        )
+                    )
                     .where(
                         getattr(
                             self.notification_model_cls,
-                            self.notification_model_cls.get_user_id_attr_name()
-                        ) == notification_id
+                            self.notification_model_cls.get_user_id_attr_name(),
+                        )
+                        == notification_id
                     )
                 )
             ).one()[0]
         return notification.get_user_email()
 
-    async def store_context_used(self, notification_id: int | str | uuid.UUID, context: dict, asyncio_lock: asyncio.Lock | None = None) -> None:
+    async def store_context_used(
+        self,
+        notification_id: int | str | uuid.UUID,
+        context: dict,
+        asyncio_lock: asyncio.Lock | None = None,
+    ) -> None:
         async with self.session_manager() as session:
             notification = (
                 await session.execute(
-                    select(self.notification_model_cls)
-                    .where(
+                    select(self.notification_model_cls).where(
                         getattr(
                             self.notification_model_cls,
-                            self.notification_model_cls.get_user_id_attr_name()
-                        ) == notification_id
+                            self.notification_model_cls.get_user_id_attr_name(),
+                        )
+                        == notification_id
                     )
                 )
             ).one()[0]

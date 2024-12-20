@@ -24,6 +24,7 @@ def create_notification_table(user_id_type: type):
         sa.Column('preheader_template', sa.String(255), nullable=True, default=""),
         sa.Column('context_name', sa.String(255), nullable=True, default=""),
         sa.Column('context_kwargs', sa.JSON, default=dict),
+        sa.Column('metadata_json', sa.JSON, nullable=True),
         sa.Column('send_after', sa.DateTime(), nullable=True),
         sa.Column('user_id', user_id_type(), nullable=False),
         sa.PrimaryKeyConstraint('id'),
