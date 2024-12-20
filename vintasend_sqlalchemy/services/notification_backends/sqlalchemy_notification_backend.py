@@ -388,7 +388,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                 )
                 .one()
             )
-            notification.context_kwargs = context
+            notification.context_used = context
             session.commit()
             session.flush()
 
@@ -770,5 +770,5 @@ class SQLAlchemyAsyncIONotificationBackend(
                     )
                 )
             ).one()[0]
-            notification.context_kwargs = context
+            notification.context_used = context
             await session.commit()
