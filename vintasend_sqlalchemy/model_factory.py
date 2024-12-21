@@ -34,7 +34,7 @@ class NotificationMixin(Base):
     context_name: Mapped[str] = mapped_column("context_name", String(255), nullable=True, default="")
     context_kwargs: Mapped[dict] = mapped_column("context_kwargs", JSON, default=dict)
     context_used: Mapped[dict | None] = mapped_column("context_used", JSON, nullable=True)
-    metadata_json: Mapped[dict | None] = mapped_column("metadata_json", JSON, nullable=True)
+    adapter_extra_parameters: Mapped[dict | None] = mapped_column("adapter_extra_parameters", JSON, nullable=True)
 
     send_after = mapped_column("send_after", DateTime, nullable=True)
 

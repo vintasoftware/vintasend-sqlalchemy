@@ -147,7 +147,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         send_after: datetime.datetime | None,
         subject_template: str | None = None,
         preheader_template: str | None = None,
-        metadata: dict | None = None,
+        adapter_extra_parameters: dict | None = None,
     ) -> Notification:
         with self.session_manager.begin() as session:
             notification_instance = self.notification_model_cls(
@@ -161,7 +161,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                 subject_template=subject_template or "",
                 preheader_template=preheader_template or "",
                 status=NotificationStatus.PENDING_SEND.value,
-                metadata_json=metadata,
+                adapter_extra_parameters=adapter_extra_parameters,
             )
             session.add(notification_instance)
             session.flush()
@@ -171,12 +171,6 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
     def persist_notification_update(
         self, notification_id: int | str | uuid.UUID, updated_data: UpdateNotificationKwargs
     ) -> Notification:
-        mapped_updated_data: dict[str, Any] = {
-            k: v for k, v in updated_data.items() if k not in ["metadata"]
-        }
-        if "metadata" in updated_data:
-            mapped_updated_data["metadata_json"] = updated_data["metadata"]
-
         with self.session_manager.begin() as session:
             records_updated = (
                 session.query(self.notification_model_cls)
@@ -187,7 +181,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                 .update(
                     {
                         getattr(self.notification_model_cls, k): v
-                        for k, v in mapped_updated_data.items()
+                        for k, v in updated_data.items()
                     }
                 )
             )
@@ -515,7 +509,7 @@ class SQLAlchemyAsyncIONotificationBackend(
         send_after: datetime.datetime | None,
         subject_template: str | None = None,
         preheader_template: str | None = None,
-        metadata: dict | None = None,
+        updated_data: dict | None = None,
         asyncio_lock: asyncio.Lock | None = None,
     ) -> Notification:
         async with self.session_manager() as session:
@@ -530,7 +524,7 @@ class SQLAlchemyAsyncIONotificationBackend(
                 subject_template=subject_template or "",
                 preheader_template=preheader_template or "",
                 status=NotificationStatus.PENDING_SEND.value,
-                metadata_json=metadata,
+                updated_data=updated_data,
             )
             session.add(notification_instance)
             await session.flush()
@@ -545,11 +539,6 @@ class SQLAlchemyAsyncIONotificationBackend(
         updated_data: UpdateNotificationKwargs,
         asyncio_lock: asyncio.Lock | None = None,
     ) -> Notification:
-        mapped_updated_data: dict[str, Any] = {
-            k: v for k, v in updated_data.items() if k not in ["metadata"]
-        }
-        if "metadata" in updated_data:
-            mapped_updated_data["metadata_json"] = updated_data["metadata"]
         async with self.session_manager() as session:
             records_updated = (
                 await session.execute(
@@ -561,7 +550,7 @@ class SQLAlchemyAsyncIONotificationBackend(
                     .values(
                         {
                             getattr(self.notification_model_cls, k): v
-                            for k, v in mapped_updated_data.items()
+                            for k, v in updated_data.items()
                         }
                     )
                 )
