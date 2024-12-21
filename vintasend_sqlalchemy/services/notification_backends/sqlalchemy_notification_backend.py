@@ -2,7 +2,7 @@ import asyncio
 import datetime
 import uuid
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Generic, TypeVar
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import NoResultFound
@@ -369,7 +369,12 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
             session.expunge(notification)
         return notification.get_user_email()
 
-    def store_context_used(self, notification_id: int | str | uuid.UUID, context: dict) -> None:
+    def store_context_used(
+        self, 
+        notification_id: int | str | uuid.UUID, 
+        context: dict,
+        adapter_import_str: str,
+    ) -> None:
         with self.session_manager.begin() as session:
             notification = (
                 session.query(self.notification_model_cls)
@@ -383,6 +388,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                 .one()
             )
             notification.context_used = context
+            notification.adapter_used = adapter_import_str
             session.commit()
             session.flush()
 
@@ -745,6 +751,7 @@ class SQLAlchemyAsyncIONotificationBackend(
         self,
         notification_id: int | str | uuid.UUID,
         context: dict,
+        adapter_import_str: str,
         asyncio_lock: asyncio.Lock | None = None,
     ) -> None:
         async with self.session_manager() as session:
@@ -760,4 +767,5 @@ class SQLAlchemyAsyncIONotificationBackend(
                 )
             ).one()[0]
             notification.context_used = context
+            notification.adapter_used = adapter_import_str
             await session.commit()

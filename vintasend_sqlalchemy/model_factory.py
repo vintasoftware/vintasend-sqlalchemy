@@ -33,6 +33,7 @@ class NotificationMixin(Base):
     preheader_template: Mapped[str] = mapped_column("preheader_template", String(255), nullable=True, default="")
     context_name: Mapped[str] = mapped_column("context_name", String(255), nullable=True, default="")
     context_kwargs: Mapped[dict] = mapped_column("context_kwargs", JSON, default=dict)
+    adapter_used: Mapped[str] = mapped_column("adapter_used", String(255), nullable=True)
     context_used: Mapped[dict | None] = mapped_column("context_used", JSON, nullable=True)
     adapter_extra_parameters: Mapped[dict | None] = mapped_column("adapter_extra_parameters", JSON, nullable=True)
 

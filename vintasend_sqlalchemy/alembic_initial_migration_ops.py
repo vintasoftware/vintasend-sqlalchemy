@@ -25,6 +25,7 @@ def create_notification_table(user_id_type: type):
         sa.Column('context_name', sa.String(255), nullable=True, default=""),
         sa.Column('context_kwargs', sa.JSON, default=dict),
         sa.Column('context_used', sa.JSON, nullable=True),
+        sa.Column('adapter_used', sa.String(255), nullable=True),
         sa.Column('adapter_extra_parameters', sa.JSON, nullable=True),
         sa.Column('send_after', sa.DateTime(), nullable=True),
         sa.Column('user_id', user_id_type(), nullable=False),
