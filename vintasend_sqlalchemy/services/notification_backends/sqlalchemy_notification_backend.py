@@ -515,7 +515,7 @@ class SQLAlchemyAsyncIONotificationBackend(
         send_after: datetime.datetime | None,
         subject_template: str | None = None,
         preheader_template: str | None = None,
-        updated_data: dict | None = None,
+        adapter_extra_parameters: dict | None = None,
         asyncio_lock: asyncio.Lock | None = None,
     ) -> Notification:
         async with self.session_manager() as session:
@@ -530,7 +530,7 @@ class SQLAlchemyAsyncIONotificationBackend(
                 subject_template=subject_template or "",
                 preheader_template=preheader_template or "",
                 status=NotificationStatus.PENDING_SEND.value,
-                updated_data=updated_data,
+                adapter_extra_parameters=adapter_extra_parameters,
             )
             session.add(notification_instance)
             await session.flush()
