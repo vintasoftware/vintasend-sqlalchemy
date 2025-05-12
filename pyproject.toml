@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "vintasend-sqlalchemy"
-version = "0.1.1"
+version = "0.1.2"
 description = "SQLAlchemy backend implementation for VintaSend"
 authors = ["Hugo bessa <hugo@vinta.com.br>"]
 license = "MIT"
@@ -9,7 +9,7 @@ readme = "README.md"
 [tool.poetry.dependencies]
 python = "<3.14,>=3.10"
 sqlalchemy = "^2.0.36"
-vintasend = "*"
+vintasend = "0.1.2"
 alembic = "^1.14.0"
 pytest-asyncio = "^0.24.0"
 greenlet = "^3.1.1"
