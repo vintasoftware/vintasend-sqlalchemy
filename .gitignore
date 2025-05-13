@@ -47,3 +47,6 @@ tmp_email/
 .tool-versions
 
 test.db
+
+# built files
+dist/
