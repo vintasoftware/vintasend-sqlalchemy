@@ -47,6 +47,10 @@ tmp_email/
 .tool-versions
 
 test.db
+# Per-xdist-worker test databases (test_gw0.db, test_master.db, ...)
+test_*.db
+# Default local attachment storage created by FilesystemAttachmentManager in tests/dev
+vintasend_attachments/
 
 # built files
 dist/
