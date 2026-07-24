@@ -1337,20 +1337,17 @@ name = "vintasend"
 version = "2.0.0"
 description = "A flexible package for implementing transactional notifications"
 optional = false
-python-versions = ">=3.10,<3.15"
+python-versions = "<3.15,>=3.10"
 groups = ["main"]
 files = [
-    {file = "vintasend-2.0.0-py3-none-any.whl", hash = "sha256:c1a6ea39390332574ce5cd94920c0bbcdd9c1da36f2d4975dc900dfc27afead8"},
+    {file = "vintasend-2.0.0-py3-none-any.whl", hash = "sha256:1c4a4796d27c8f1f7b30e802735734376d60e60c6aedbb65bd0b9100bb973882"},
+    {file = "vintasend-2.0.0.tar.gz", hash = "sha256:3b2e334f769cd528ff990bf43c4efdc4d014ef9d92922b98aa9f3363c1f47926"},
 ]
 
 [package.dependencies]
 packaging = ">=26.2,<27.0"
 requests = ">=2.34.2,<3.0.0"
 typing-extensions = ">=4.15.0,<5.0.0"
-
-[package.source]
-type = "file"
-url = "../../dist/vintasend-2.0.0-py3-none-any.whl"
 
 [[package]]
 name = "virtualenv"
