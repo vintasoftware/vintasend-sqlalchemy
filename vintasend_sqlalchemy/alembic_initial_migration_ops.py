@@ -5,32 +5,33 @@ from alembic import op
 
 
 def create_notification_table(user_id_type: type):
-    return op.create_table('notifications',
+    return op.create_table(
+        "notifications",
         sa.Column("id", sa.BigInteger().with_variant(sa.Integer, "sqlite"), primary_key=True),
-        sa.Column('notification_type', sa.String(50), nullable=False),
-        sa.Column('title', sa.String(255), nullable=False),
-        sa.Column('status', sa.String(50), nullable=False, default="PENDING_SEND"),
-        sa.Column('body_template', sa.String(255), nullable=False),
+        sa.Column("notification_type", sa.String(50), nullable=False),
+        sa.Column("title", sa.String(255), nullable=False),
+        sa.Column("status", sa.String(50), nullable=False, default="PENDING_SEND"),
+        sa.Column("body_template", sa.String(255), nullable=False),
         sa.Column(
-            'created', sa.DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc)
+            "created", sa.DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc)
         ),
         sa.Column(
-            'updated',
+            "updated",
             sa.DateTime,
             default=lambda: datetime.datetime.now(datetime.timezone.utc),
             onupdate=lambda: datetime.datetime.now(datetime.timezone.utc),
         ),
-        sa.Column('subject_template', sa.String(255), nullable=True, default=""),
-        sa.Column('preheader_template', sa.String(255), nullable=True, default=""),
-        sa.Column('context_name', sa.String(255), nullable=True, default=""),
-        sa.Column('context_kwargs', sa.JSON, default=dict),
-        sa.Column('context_used', sa.JSON, nullable=True),
-        sa.Column('adapter_used', sa.String(255), nullable=True),
-        sa.Column('adapter_extra_parameters', sa.JSON, nullable=True),
-        sa.Column('send_after', sa.DateTime(), nullable=True),
-        sa.Column('user_id', user_id_type(), nullable=False),
-        sa.PrimaryKeyConstraint('id'),
-        sa.ForeignKeyConstraint(['user_id'], ['users.id'])
+        sa.Column("subject_template", sa.String(255), nullable=True, default=""),
+        sa.Column("preheader_template", sa.String(255), nullable=True, default=""),
+        sa.Column("context_name", sa.String(255), nullable=True, default=""),
+        sa.Column("context_kwargs", sa.JSON, default=dict),
+        sa.Column("context_used", sa.JSON, nullable=True),
+        sa.Column("adapter_used", sa.String(255), nullable=True),
+        sa.Column("adapter_extra_parameters", sa.JSON, nullable=True),
+        sa.Column("send_after", sa.DateTime(), nullable=True),
+        sa.Column("user_id", user_id_type(), nullable=False),
+        sa.PrimaryKeyConstraint("id"),
+        sa.ForeignKeyConstraint(["user_id"], ["users.id"]),
     )
 
 
@@ -55,6 +56,29 @@ def upgrade_notification_table_to_2_0(user_id_type: type = sa.Integer):
     op.create_index("ix_notifications_tenant", "notifications", ["tenant"])
 
 
+def upgrade_notification_table_to_2_1(user_id_type: type = sa.Integer):
+    """Add the VintaSend 2.1 template-version columns to an existing ``notifications`` table.
+
+    ``requested_template_version`` is which version of its template a notification renders --
+    NULL meaning "whatever is current at send time", which is how every notification written
+    before this behaves. ``used_template_version`` is the version the renderer reported it
+    actually used, written by the service at send time.
+
+    Both are nullable with no backfill: a notification that predates the columns was rendered
+    against whatever the template said at the time, and there is no honest value to invent for
+    it. ``user_id_type`` is unused here and kept only so this reads like its 2.0 sibling.
+    """
+    with op.batch_alter_table("notifications") as batch_op:
+        batch_op.add_column(sa.Column("requested_template_version", sa.Integer(), nullable=True))
+        batch_op.add_column(sa.Column("used_template_version", sa.Integer(), nullable=True))
+
+
+def downgrade_notification_table_from_2_1(user_id_type: type = sa.Integer):
+    with op.batch_alter_table("notifications") as batch_op:
+        batch_op.drop_column("used_template_version")
+        batch_op.drop_column("requested_template_version")
+
+
 def create_attachment_tables():
     """Create the ``attachment_file_records`` and ``notification_attachments`` tables.
 
@@ -73,9 +97,7 @@ def create_attachment_tables():
         sa.Column("updated", sa.DateTime()),
         sa.PrimaryKeyConstraint("id"),
     )
-    op.create_index(
-        "ix_attachment_file_records_checksum", "attachment_file_records", ["checksum"]
-    )
+    op.create_index("ix_attachment_file_records_checksum", "attachment_file_records", ["checksum"])
     op.create_index(
         "ix_attachment_file_records_checksum_size",
         "attachment_file_records",
@@ -100,9 +122,7 @@ def create_attachment_tables():
         sa.Column("created", sa.DateTime()),
         sa.Column("updated", sa.DateTime()),
         sa.PrimaryKeyConstraint("id"),
-        sa.ForeignKeyConstraint(
-            ["notification_id"], ["notifications.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["notification_id"], ["notifications.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["file_id"], ["attachment_file_records.id"]),
     )
     op.create_index(
@@ -110,9 +130,7 @@ def create_attachment_tables():
         "notification_attachments",
         ["notification_id"],
     )
-    op.create_index(
-        "ix_notification_attachments_file_id", "notification_attachments", ["file_id"]
-    )
+    op.create_index("ix_notification_attachments_file_id", "notification_attachments", ["file_id"])
 
 
 def drop_attachment_tables():
@@ -121,9 +139,7 @@ def drop_attachment_tables():
         "ix_notification_attachments_notification_id", table_name="notification_attachments"
     )
     op.drop_table("notification_attachments")
-    op.drop_index(
-        "ix_attachment_file_records_checksum_size", table_name="attachment_file_records"
-    )
+    op.drop_index("ix_attachment_file_records_checksum_size", table_name="attachment_file_records")
     op.drop_index("ix_attachment_file_records_checksum", table_name="attachment_file_records")
     op.drop_table("attachment_file_records")
 

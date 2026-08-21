@@ -128,12 +128,65 @@ async def test_filter_notifications_empty_and_negation(async_db_session, user_id
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_filter_notifications_by_template_version(async_db_session, user_id):
+    """Same filter translation as the sync backend -- it is the one shared builder."""
+    backend = _backend(async_db_session)
+    pinned = await _persist(backend, user_id, requested_template_version=3)
+    await _persist(backend, user_id)
+    await backend.store_template_version(pinned.id, 3)
+
+    requested = list(await backend.filter_notifications({"requested_template_version": 3}, 1, 50))
+    assert {n.id for n in requested} == {pinned.id}
+
+    used = list(await backend.filter_notifications({"used_template_version": [3, 4]}, 1, 50))
+    assert {n.id for n in used} == {pinned.id}
+
+    # A non-int candidate matches nothing rather than raising on the bind.
+    assert list(await backend.filter_notifications({"used_template_version": "3"}, 1, 50)) == []
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_store_git_commit_sha(async_db_session, user_id):
     backend = _backend(async_db_session)
     notification = await _persist(backend, user_id)
     sha = "b" * 40
     await backend.store_git_commit_sha(notification.id, sha)
     assert (await backend.get_notification(notification.id)).git_commit_sha == sha
+
+
+# --------------------------------------------------------------- template versions
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_persist_notification_records_the_requested_template_version(
+    async_db_session, user_id
+):
+    backend = _backend(async_db_session)
+
+    notification = await _persist(backend, user_id, requested_template_version=3)
+
+    assert notification.requested_template_version == 3
+    assert (await backend.get_notification(notification.id)).requested_template_version == 3
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_a_notification_with_no_pin_stores_null(async_db_session, user_id):
+    backend = _backend(async_db_session)
+
+    notification = await _persist(backend, user_id)
+
+    assert notification.requested_template_version is None
+    assert notification.used_template_version is None
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_store_template_version(async_db_session, user_id):
+    backend = _backend(async_db_session)
+    notification = await _persist(backend, user_id)
+
+    await backend.store_template_version(notification.id, 5)
+
+    assert (await backend.get_notification(notification.id)).used_template_version == 5
 
 
 @pytest.mark.asyncio(loop_scope="session")

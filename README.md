@@ -16,6 +16,14 @@ This release implements the full vintasend 2.0 backend contract: one-off notific
 composable filtering / ordering API (`filter_notifications`), `sent_at` / `read_at`, the `tenant`
 partition key, `git_commit_sha`, bulk read, and the attachment manager seam.
 
+It also persists vintasend's template-version fields: `requested_template_version` (which version
+of its template a notification renders) and `used_template_version` (which version the renderer
+reported it actually used, written through `store_template_version` at send time). Both are
+filterable -- `{"requested_template_version": 3}`, `{"used_template_version": [1, 2]}` -- as
+integer membership, with the same NULL semantics as every other field: a notification with no
+version never matches positively and is included under negation. See
+[Template Version Pinning](https://github.com/vintasoftware/vintasend#template-version-pinning).
+
 ## Backends
 
 ```python
@@ -62,7 +70,13 @@ The package ships Alembic helper ops so your migrations stay in sync with the mo
 - `create_notification_table(user_id_type)` - the base `notifications` table.
 - `upgrade_notification_table_to_2_0()` - adds the 2.0 columns (one-off recipient fields,
   `sent_at`, `read_at`, `tenant`, `git_commit_sha`) and relaxes `user_id` to nullable.
+- `upgrade_notification_table_to_2_1()` - adds the 2.1 template-version columns
+  (`requested_template_version`, `used_template_version`). Both nullable, no backfill: a
+  notification written before them was rendered against whatever its template said at the time,
+  and there is no honest value to invent for it.
 - `create_attachment_tables()` - the `attachment_file_records` and `notification_attachments`
   tables backing the attachment seam.
+
+Each has a matching `downgrade_notification_table_from_*` / `drop_attachment_tables`.
 
 See `migrations/versions/` for the reference migrations used by the test suite.

@@ -812,7 +812,7 @@ version = "26.2"
 description = "Core utilities for Python packages"
 optional = false
 python-versions = ">=3.8"
-groups = ["main", "dev"]
+groups = ["dev"]
 files = [
     {file = "packaging-26.2-py3-none-any.whl", hash = "sha256:5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e"},
     {file = "packaging-26.2.tar.gz", hash = "sha256:ff452ff5a3e828ce110190feff1178bb1f2ea2281fa2075aadb987c2fb221661"},
@@ -1337,17 +1337,18 @@ name = "vintasend"
 version = "2.0.0"
 description = "A flexible package for implementing transactional notifications"
 optional = false
-python-versions = "<3.15,>=3.10"
+python-versions = ">=3.10,<3.15"
 groups = ["main"]
-files = [
-    {file = "vintasend-2.0.0-py3-none-any.whl", hash = "sha256:1c4a4796d27c8f1f7b30e802735734376d60e60c6aedbb65bd0b9100bb973882"},
-    {file = "vintasend-2.0.0.tar.gz", hash = "sha256:3b2e334f769cd528ff990bf43c4efdc4d014ef9d92922b98aa9f3363c1f47926"},
-]
+files = []
+develop = true
 
 [package.dependencies]
-packaging = ">=26.2,<27.0"
-requests = ">=2.34.2,<3.0.0"
-typing-extensions = ">=4.15.0,<5.0.0"
+requests = "^2.34.2"
+typing-extensions = ">=4.10.0"
+
+[package.source]
+type = "directory"
+url = "../.."
 
 [[package]]
 name = "virtualenv"
@@ -1371,4 +1372,4 @@ typing-extensions = {version = ">=4.13.2", markers = "python_version < \"3.11\""
 [metadata]
 lock-version = "2.1"
 python-versions = "<3.15,>=3.10"
-content-hash = "f8338d4c0d5a2fd78869900cf86f2547cb41cf2ae2d431ce828abe875e23955f"
+content-hash = "d688157cb2779ed21f7170892606753d99ec64ed91832e54b9b4d07c87668ec4"

@@ -122,7 +122,9 @@ def test_mark_sent_as_read_bulk_is_scoped_and_idempotent(db_session, user_id):
     for n in (n1, n2, other_notification):
         backend.mark_pending_as_sent(n.id)
 
-    result = list(backend.mark_sent_as_read_bulk([n1.id, n2.id, other_notification.id], user_id=user_id))
+    result = list(
+        backend.mark_sent_as_read_bulk([n1.id, n2.id, other_notification.id], user_id=user_id)
+    )
     read_ids = {r.id for r in result}
     assert n1.id in read_ids
     assert n2.id in read_ids
@@ -213,6 +215,46 @@ def test_filter_notifications_membership_list_and_date_range(db_session, user_id
     assert list(empty) == []
 
 
+def test_filter_notifications_by_template_version(db_session, user_id):
+    """Which notifications are pinned to a version, and which one each actually rendered."""
+    backend = _backend(db_session)
+    pinned = _persist(backend, user_id, requested_template_version=3)
+    other = _persist(backend, user_id, requested_template_version=4)
+    backend.store_template_version(pinned.id, 3)
+
+    requested = backend.filter_notifications({"requested_template_version": 3}, 1, 50)
+    assert {n.id for n in requested} == {pinned.id}
+
+    used = backend.filter_notifications({"used_template_version": 3}, 1, 50)
+    assert {n.id for n in used} == {pinned.id}
+
+    listed = backend.filter_notifications({"requested_template_version": [3, 4]}, 1, 50)
+    assert {n.id for n in listed} == {pinned.id, other.id}
+    assert backend.count_notifications({"requested_template_version": [3, 4]}) == 2
+
+
+def test_filter_notifications_version_null_semantics(db_session, user_id):
+    """No version is not version zero, and negation brings the unpinned rows back."""
+    backend = _backend(db_session)
+    pinned = _persist(backend, user_id, requested_template_version=1)
+    unpinned = _persist(backend, user_id)
+
+    positive = backend.filter_notifications({"requested_template_version": 1}, 1, 50)
+    assert {n.id for n in positive} == {pinned.id}
+
+    negated = backend.filter_notifications({"not": {"requested_template_version": 1}}, 1, 50)
+    assert unpinned.id in {n.id for n in negated}
+
+
+def test_filter_notifications_rejects_a_non_integer_version(db_session, user_id):
+    """Forwarding a stringified version would raise on the bind rather than match nothing."""
+    backend = _backend(db_session)
+    _persist(backend, user_id, requested_template_version=3)
+
+    assert list(backend.filter_notifications({"requested_template_version": "3"}, 1, 50)) == []
+    assert list(backend.filter_notifications({"requested_template_version": [3, "x"]}, 1, 50)) == []
+
+
 def test_filter_notifications_ordering_is_stable(db_session, user_id):
     backend = _backend(db_session)
     first = _persist(backend, user_id)
@@ -256,6 +298,56 @@ def test_store_git_commit_sha(db_session, user_id):
     sha = "a" * 40
     backend.store_git_commit_sha(notification.id, sha)
     assert backend.get_notification(notification.id).git_commit_sha == sha
+
+
+# --------------------------------------------------------------- template versions
+
+
+def test_persist_notification_records_the_requested_template_version(db_session, user_id):
+    backend = _backend(db_session)
+
+    notification = _persist(backend, user_id, requested_template_version=3)
+
+    assert notification.requested_template_version == 3
+    assert backend.get_notification(notification.id).requested_template_version == 3
+
+
+def test_a_notification_with_no_pin_stores_null(db_session, user_id):
+    backend = _backend(db_session)
+
+    notification = _persist(backend, user_id)
+
+    assert notification.requested_template_version is None
+    assert notification.used_template_version is None
+
+
+def test_store_template_version(db_session, user_id):
+    backend = _backend(db_session)
+    notification = _persist(backend, user_id)
+
+    backend.store_template_version(notification.id, 5)
+
+    assert backend.get_notification(notification.id).used_template_version == 5
+
+
+def test_a_one_off_notification_records_the_requested_template_version(db_session, user_id):
+    backend = _backend(db_session)
+
+    notification = backend.persist_one_off_notification(
+        email_or_phone="someone@example.com",
+        first_name="Some",
+        last_name="One",
+        notification_type=NotificationTypes.EMAIL.value,
+        title="test",
+        body_template="test",
+        context_name="test",
+        context_kwargs={},
+        send_after=None,
+        requested_template_version=2,
+    )
+
+    assert notification.requested_template_version == 2
+    assert backend.get_notification(notification.id).requested_template_version == 2
 
 
 def test_attachment_upload_dedup_and_get(db_session, user_id):

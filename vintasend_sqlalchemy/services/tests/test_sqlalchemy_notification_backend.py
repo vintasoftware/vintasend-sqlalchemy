@@ -1,5 +1,4 @@
 import datetime
-import os
 import uuid
 from datetime import timedelta
 from unittest import TestCase
@@ -38,7 +37,9 @@ class SQLAlchemyNotificationBackendTestCase(TestCase):
             session.flush()
 
     def test_persist_notification(self):
-        notification = SQLAlchemyNotificationBackend(self.session, NotificationModel).persist_notification(
+        notification = SQLAlchemyNotificationBackend(
+            self.session, NotificationModel
+        ).persist_notification(
             user_id=self.user_id,
             notification_type=NotificationTypes.EMAIL.value,
             title="test",
@@ -64,7 +65,9 @@ class SQLAlchemyNotificationBackendTestCase(TestCase):
         assert notification.id is not None
 
         with self.session.begin() as session:
-            notification_db_record = session.query(NotificationModel).filter_by(id=notification.id).one()
+            notification_db_record = (
+                session.query(NotificationModel).filter_by(id=notification.id).one()
+            )
             session.flush()
             assert notification_db_record.get_user_id() == self.user_id
             assert notification_db_record.notification_type == NotificationTypes.EMAIL.value
@@ -78,7 +81,9 @@ class SQLAlchemyNotificationBackendTestCase(TestCase):
             assert notification_db_record.status == NotificationStatus.PENDING_SEND.value
 
     def test_update_notification(self):
-        notification = SQLAlchemyNotificationBackend(self.session, NotificationModel).persist_notification(
+        notification = SQLAlchemyNotificationBackend(
+            self.session, NotificationModel
+        ).persist_notification(
             user_id=self.user_id,
             notification_type=NotificationTypes.EMAIL.value,
             title="test",
@@ -90,10 +95,10 @@ class SQLAlchemyNotificationBackendTestCase(TestCase):
             preheader_template="test",
         )
 
-        updated_data: UpdateNotificationKwargs = {
-            "subject_template": "updated test subject"
-        }
-        updated_notification = SQLAlchemyNotificationBackend(self.session, NotificationModel).persist_notification_update(
+        updated_data: UpdateNotificationKwargs = {"subject_template": "updated test subject"}
+        updated_notification = SQLAlchemyNotificationBackend(
+            self.session, NotificationModel
+        ).persist_notification_update(
             notification_id=notification.id,
             updated_data=updated_data,
         )
@@ -101,7 +106,9 @@ class SQLAlchemyNotificationBackendTestCase(TestCase):
         assert updated_notification.subject_template == "updated test subject"
 
         with self.session.begin() as session:
-            notification_db_record = session.query(NotificationModel).filter_by(id=notification.id).one()
+            notification_db_record = (
+                session.query(NotificationModel).filter_by(id=notification.id).one()
+            )
             assert notification_db_record.subject_template == "updated test subject"
 
     def get_all_pending_notifications(self):
@@ -129,7 +136,9 @@ class SQLAlchemyNotificationBackendTestCase(TestCase):
             preheader_template="test 2",
         )
 
-        already_sent = SQLAlchemyNotificationBackend(self.session, NotificationModel).persist_notification(
+        already_sent = SQLAlchemyNotificationBackend(
+            self.session, NotificationModel
+        ).persist_notification(
             user_id=self.user_id,
             notification_type=NotificationTypes.EMAIL.value,
             title="test already sent",
@@ -140,10 +149,16 @@ class SQLAlchemyNotificationBackendTestCase(TestCase):
             subject_template="test already sent",
             preheader_template="test already sent",
         )
-        SQLAlchemyNotificationBackend(self.session, NotificationModel).mark_pending_as_sent(notification_id=already_sent.id)
+        SQLAlchemyNotificationBackend(self.session, NotificationModel).mark_pending_as_sent(
+            notification_id=already_sent.id
+        )
 
-        notifications = list(SQLAlchemyNotificationBackend(self.session, NotificationModel).get_all_pending_notifications())
-        assert len((notifications)) == 2
+        notifications = list(
+            SQLAlchemyNotificationBackend(
+                self.session, NotificationModel
+            ).get_all_pending_notifications()
+        )
+        assert len(notifications) == 2
         notification_1 = notifications[1]
         assert isinstance(notification_1, Notification)
         assert notification_1.user_id == self.user_id
@@ -194,7 +209,9 @@ class SQLAlchemyNotificationBackendTestCase(TestCase):
             preheader_template="test 2",
         )
 
-        already_sent = SQLAlchemyNotificationBackend(self.session, NotificationModel).persist_notification(
+        already_sent = SQLAlchemyNotificationBackend(
+            self.session, NotificationModel
+        ).persist_notification(
             user_id=self.user_id,
             notification_type=NotificationTypes.EMAIL.value,
             title="test already sent",
@@ -211,7 +228,9 @@ class SQLAlchemyNotificationBackendTestCase(TestCase):
         )
 
         notifications = list(
-            SQLAlchemyNotificationBackend(self.session, NotificationModel).get_pending_notifications(page=1, page_size=1)
+            SQLAlchemyNotificationBackend(
+                self.session, NotificationModel
+            ).get_pending_notifications(page=1, page_size=1)
         )
         assert len(notifications) == 1
         notification_1 = notifications[0]
@@ -228,7 +247,9 @@ class SQLAlchemyNotificationBackendTestCase(TestCase):
         assert notification_1.status == NotificationStatus.PENDING_SEND.value
 
         notifications = list(
-            SQLAlchemyNotificationBackend(self.session, NotificationModel).get_pending_notifications(page=2, page_size=1)
+            SQLAlchemyNotificationBackend(
+                self.session, NotificationModel
+            ).get_pending_notifications(page=2, page_size=1)
         )
         assert len(notifications) == 1
         notification_2 = notifications[0]
@@ -245,7 +266,9 @@ class SQLAlchemyNotificationBackendTestCase(TestCase):
         assert notification_2.status == NotificationStatus.PENDING_SEND.value
 
     def test_mark_pending_as_sent(self):
-        notification = SQLAlchemyNotificationBackend(self.session, NotificationModel).persist_notification(
+        notification = SQLAlchemyNotificationBackend(
+            self.session, NotificationModel
+        ).persist_notification(
             user_id=self.user_id,
             notification_type=NotificationTypes.EMAIL.value,
             title="test",
@@ -257,15 +280,21 @@ class SQLAlchemyNotificationBackendTestCase(TestCase):
             preheader_template="test",
         )
 
-        notification = SQLAlchemyNotificationBackend(self.session, NotificationModel).mark_pending_as_sent(notification.id)
+        notification = SQLAlchemyNotificationBackend(
+            self.session, NotificationModel
+        ).mark_pending_as_sent(notification.id)
         assert notification.status == NotificationStatus.SENT.value
         with self.session.begin() as session:
-            notification_db_record = session.query(NotificationModel).filter_by(id=notification.id).one()
+            notification_db_record = (
+                session.query(NotificationModel).filter_by(id=notification.id).one()
+            )
             session.flush()
             assert notification_db_record.status == NotificationStatus.SENT.value
 
     def test_mark_pending_as_failed(self):
-        notification = SQLAlchemyNotificationBackend(self.session, NotificationModel).persist_notification(
+        notification = SQLAlchemyNotificationBackend(
+            self.session, NotificationModel
+        ).persist_notification(
             user_id=self.user_id,
             notification_type=NotificationTypes.EMAIL.value,
             title="test",
@@ -277,15 +306,21 @@ class SQLAlchemyNotificationBackendTestCase(TestCase):
             preheader_template="test",
         )
 
-        notification = SQLAlchemyNotificationBackend(self.session, NotificationModel).mark_pending_as_failed(notification.id)
+        notification = SQLAlchemyNotificationBackend(
+            self.session, NotificationModel
+        ).mark_pending_as_failed(notification.id)
         assert notification.status == NotificationStatus.FAILED.value
         with self.session.begin() as session:
-            notification_db_record = session.query(NotificationModel).filter_by(id=notification.id).one()
+            notification_db_record = (
+                session.query(NotificationModel).filter_by(id=notification.id).one()
+            )
             session.flush()
             assert notification_db_record.status == NotificationStatus.FAILED.value
 
     def test_mark_pending_as_failed_already_sent(self):
-        notification = SQLAlchemyNotificationBackend(self.session, NotificationModel).persist_notification(
+        notification = SQLAlchemyNotificationBackend(
+            self.session, NotificationModel
+        ).persist_notification(
             user_id=self.user_id,
             notification_type=NotificationTypes.EMAIL.value,
             title="test",
@@ -296,16 +331,24 @@ class SQLAlchemyNotificationBackendTestCase(TestCase):
             subject_template="test",
             preheader_template="test",
         )
-        SQLAlchemyNotificationBackend(self.session, NotificationModel).mark_pending_as_sent(notification.id)
+        SQLAlchemyNotificationBackend(self.session, NotificationModel).mark_pending_as_sent(
+            notification.id
+        )
 
         with pytest.raises(NotificationUpdateError):
-            SQLAlchemyNotificationBackend(self.session, NotificationModel).mark_pending_as_failed(notification.id)
+            SQLAlchemyNotificationBackend(self.session, NotificationModel).mark_pending_as_failed(
+                notification.id
+            )
         with self.session.begin() as session:
-            notification_db_record = session.query(NotificationModel).filter_by(id=notification.id).one()
+            notification_db_record = (
+                session.query(NotificationModel).filter_by(id=notification.id).one()
+            )
             assert notification_db_record.status == NotificationStatus.SENT.value
 
     def test_mark_sent_as_read(self):
-        notification = SQLAlchemyNotificationBackend(self.session, NotificationModel).persist_notification(
+        notification = SQLAlchemyNotificationBackend(
+            self.session, NotificationModel
+        ).persist_notification(
             user_id=self.user_id,
             notification_type=NotificationTypes.EMAIL.value,
             title="test",
@@ -316,17 +359,25 @@ class SQLAlchemyNotificationBackendTestCase(TestCase):
             subject_template="test",
             preheader_template="test",
         )
-        SQLAlchemyNotificationBackend(self.session, NotificationModel).mark_pending_as_sent(notification.id)
+        SQLAlchemyNotificationBackend(self.session, NotificationModel).mark_pending_as_sent(
+            notification.id
+        )
 
-        notification = SQLAlchemyNotificationBackend(self.session, NotificationModel).mark_sent_as_read(notification.id)
+        notification = SQLAlchemyNotificationBackend(
+            self.session, NotificationModel
+        ).mark_sent_as_read(notification.id)
         assert notification.status == NotificationStatus.READ.value
         with self.session.begin() as session:
-            notification_db_record = session.query(NotificationModel).filter_by(id=notification.id).one()
+            notification_db_record = (
+                session.query(NotificationModel).filter_by(id=notification.id).one()
+            )
             session.flush()
             assert notification_db_record.status == NotificationStatus.READ.value
 
     def test_cancel_notification(self):
-        notification = SQLAlchemyNotificationBackend(self.session, NotificationModel).persist_notification(
+        notification = SQLAlchemyNotificationBackend(
+            self.session, NotificationModel
+        ).persist_notification(
             user_id=self.user_id,
             notification_type=NotificationTypes.EMAIL.value,
             title="test",
@@ -338,14 +389,20 @@ class SQLAlchemyNotificationBackendTestCase(TestCase):
             preheader_template="test",
         )
 
-        SQLAlchemyNotificationBackend(self.session, NotificationModel).cancel_notification(notification.id)
+        SQLAlchemyNotificationBackend(self.session, NotificationModel).cancel_notification(
+            notification.id
+        )
         with self.session.begin() as session:
-            notification_db_record = session.query(NotificationModel).filter_by(id=notification.id).one()
+            notification_db_record = (
+                session.query(NotificationModel).filter_by(id=notification.id).one()
+            )
             session.flush()
             assert notification_db_record.status == NotificationStatus.CANCELLED.value
 
     def test_cancel_notification_already_sent(self):
-        notification = SQLAlchemyNotificationBackend(self.session, NotificationModel).persist_notification(
+        notification = SQLAlchemyNotificationBackend(
+            self.session, NotificationModel
+        ).persist_notification(
             user_id=self.user_id,
             notification_type=NotificationTypes.EMAIL.value,
             title="test",
@@ -356,17 +413,25 @@ class SQLAlchemyNotificationBackendTestCase(TestCase):
             subject_template="test",
             preheader_template="test",
         )
-        SQLAlchemyNotificationBackend(self.session, NotificationModel).mark_pending_as_sent(notification.id)
+        SQLAlchemyNotificationBackend(self.session, NotificationModel).mark_pending_as_sent(
+            notification.id
+        )
 
         with pytest.raises(NotificationCancelError):
-            SQLAlchemyNotificationBackend(self.session, NotificationModel).cancel_notification(notification.id)
+            SQLAlchemyNotificationBackend(self.session, NotificationModel).cancel_notification(
+                notification.id
+            )
 
         with self.session.begin() as session:
-            notification_db_record = session.query(NotificationModel).filter_by(id=notification.id).one()
+            notification_db_record = (
+                session.query(NotificationModel).filter_by(id=notification.id).one()
+            )
             assert notification_db_record.status != NotificationStatus.CANCELLED.value
 
     def test_get_notification(self):
-        notification = SQLAlchemyNotificationBackend(self.session, NotificationModel).persist_notification(
+        notification = SQLAlchemyNotificationBackend(
+            self.session, NotificationModel
+        ).persist_notification(
             user_id=self.user_id,
             notification_type=NotificationTypes.EMAIL.value,
             title="test",
@@ -378,7 +443,9 @@ class SQLAlchemyNotificationBackendTestCase(TestCase):
             preheader_template="test",
         )
 
-        notification_retrieved = SQLAlchemyNotificationBackend(self.session, NotificationModel).get_notification(notification.id)
+        notification_retrieved = SQLAlchemyNotificationBackend(
+            self.session, NotificationModel
+        ).get_notification(notification.id)
         assert notification_retrieved.id == notification.id
         assert notification_retrieved.user_id == self.user_id
         assert notification_retrieved.notification_type == NotificationTypes.EMAIL.value
@@ -393,10 +460,14 @@ class SQLAlchemyNotificationBackendTestCase(TestCase):
 
     def test_get_notification_not_found(self):
         with pytest.raises(NotificationNotFoundError):
-            SQLAlchemyNotificationBackend(self.session, NotificationModel).get_notification(uuid.uuid4())
+            SQLAlchemyNotificationBackend(self.session, NotificationModel).get_notification(
+                uuid.uuid4()
+            )
 
     def test_get_notification_cancelled(self):
-        notification = SQLAlchemyNotificationBackend(self.session, NotificationModel).persist_notification(
+        notification = SQLAlchemyNotificationBackend(
+            self.session, NotificationModel
+        ).persist_notification(
             user_id=self.user_id,
             notification_type=NotificationTypes.EMAIL.value,
             title="test",
@@ -407,6 +478,10 @@ class SQLAlchemyNotificationBackendTestCase(TestCase):
             subject_template="test",
             preheader_template="test",
         )
-        SQLAlchemyNotificationBackend(self.session, NotificationModel).cancel_notification(notification.id)
+        SQLAlchemyNotificationBackend(self.session, NotificationModel).cancel_notification(
+            notification.id
+        )
         with pytest.raises(NotificationNotFoundError):
-            SQLAlchemyNotificationBackend(self.session, NotificationModel).get_notification(notification.id)
+            SQLAlchemyNotificationBackend(self.session, NotificationModel).get_notification(
+                notification.id
+            )

@@ -26,10 +26,14 @@ class Base(DeclarativeBase):
 
 class NotificationMixin(Base):
     __abstract__ = True
-    id: Mapped[int] = mapped_column("id", BigInteger().with_variant(Integer, "sqlite"), primary_key=True)  # noqa: A003
+    id: Mapped[int] = mapped_column(
+        "id", BigInteger().with_variant(Integer, "sqlite"), primary_key=True
+    )  # noqa: A003
     notification_type: Mapped[str] = mapped_column("notification_type", String(50), nullable=False)
     title: Mapped[str] = mapped_column("title", String(255), nullable=False)
-    status: Mapped[str] = mapped_column("status", String(50), nullable=False, default="PENDING_SEND")
+    status: Mapped[str] = mapped_column(
+        "status", String(50), nullable=False, default="PENDING_SEND"
+    )
     body_template: Mapped[str] = mapped_column("body_template", String(255), nullable=False)
 
     # One-off recipient fields. A one-off notification has no ``user_id`` and instead carries
@@ -63,18 +67,40 @@ class NotificationMixin(Base):
 
     # System-managed: written only by NotificationService (through ``store_git_commit_sha``)
     # at send time, always already normalized to 40 lowercase hex characters.
-    git_commit_sha: Mapped[str | None] = mapped_column(
-        "git_commit_sha", String(40), nullable=True
+    git_commit_sha: Mapped[str | None] = mapped_column("git_commit_sha", String(40), nullable=True)
+
+    # Which version of ``body_template`` this notification renders, for a template renderer
+    # whose templates are versioned (a store-backed one -- a file on disk has no version).
+    # NULL means "whatever is current at send time", which is how a notification behaves unless
+    # a version was passed on create/update or the service was built with
+    # ``pin_template_versions=True``.
+    requested_template_version: Mapped[int | None] = mapped_column(
+        "requested_template_version", Integer, nullable=True
+    )
+    # System-managed: written only by NotificationService (through ``store_template_version``)
+    # at send time, from the version the renderer reported it actually used. On an unpinned
+    # notification this is the only record of which version went out, since the template has
+    # moved on by the time anyone asks.
+    used_template_version: Mapped[int | None] = mapped_column(
+        "used_template_version", Integer, nullable=True
     )
 
     # Email specific fields
-    subject_template: Mapped[str] = mapped_column("subject_template", String(255), nullable=True, default="")
-    preheader_template: Mapped[str] = mapped_column("preheader_template", String(255), nullable=True, default="")
-    context_name: Mapped[str] = mapped_column("context_name", String(255), nullable=True, default="")
+    subject_template: Mapped[str] = mapped_column(
+        "subject_template", String(255), nullable=True, default=""
+    )
+    preheader_template: Mapped[str] = mapped_column(
+        "preheader_template", String(255), nullable=True, default=""
+    )
+    context_name: Mapped[str] = mapped_column(
+        "context_name", String(255), nullable=True, default=""
+    )
     context_kwargs: Mapped[dict] = mapped_column("context_kwargs", JSON, default=dict)
     adapter_used: Mapped[str] = mapped_column("adapter_used", String(255), nullable=True)
     context_used: Mapped[dict | None] = mapped_column("context_used", JSON, nullable=True)
-    adapter_extra_parameters: Mapped[dict | None] = mapped_column("adapter_extra_parameters", JSON, nullable=True)
+    adapter_extra_parameters: Mapped[dict | None] = mapped_column(
+        "adapter_extra_parameters", JSON, nullable=True
+    )
 
     send_after = mapped_column("send_after", DateTime, nullable=True)
 
@@ -177,29 +203,37 @@ class NotificationAttachment(Base):
     file: Mapped["AttachmentFileRecord"] = relationship("AttachmentFileRecord")
 
 
-UserType = TypeVar('UserType', bound=DeclarativeBase)
-UserPrimaryKeyType = TypeVar('UserPrimaryKeyType', int, str, uuid.UUID)
+UserType = TypeVar("UserType", bound=DeclarativeBase)
+UserPrimaryKeyType = TypeVar("UserPrimaryKeyType", int, str, uuid.UUID)
 
 
 class NotificationMeta(DeclarativeAttributeIntercept):
-    def __new__(cls, name, bases, dct, user_model, user_primary_key_field_name, user_primary_key_field_type):
+    def __new__(
+        cls, name, bases, dct, user_model, user_primary_key_field_name, user_primary_key_field_type
+    ):
         # user_id is nullable so a one-off notification (no user, recipient carried inline
         # via email_or_phone/first_name/last_name) can live in the same table.
-        if user_primary_key_field_type == int:
-            dct['user_id'] = mapped_column(ForeignKey(getattr(user_model, user_primary_key_field_name)), nullable=True)
-            dct['set_user_id'] = lambda self, user_id: setattr(self, 'user_id', user_id)
-        elif user_primary_key_field_type == str:
-            dct['user_id'] = mapped_column(ForeignKey(getattr(user_model, user_primary_key_field_name)), nullable=True)
-            dct['set_user_id'] = lambda self, user_id: setattr(self, 'user_id', user_id)
+        if user_primary_key_field_type is int:
+            dct["user_id"] = mapped_column(
+                ForeignKey(getattr(user_model, user_primary_key_field_name)), nullable=True
+            )
+            dct["set_user_id"] = lambda self, user_id: setattr(self, "user_id", user_id)
+        elif user_primary_key_field_type is str:
+            dct["user_id"] = mapped_column(
+                ForeignKey(getattr(user_model, user_primary_key_field_name)), nullable=True
+            )
+            dct["set_user_id"] = lambda self, user_id: setattr(self, "user_id", user_id)
         elif user_primary_key_field_type == uuid.UUID:
-            dct['user_id'] = mapped_column(ForeignKey(getattr(user_model, user_primary_key_field_name)), nullable=True)
-            dct['set_user_id'] = lambda self, user_id: setattr(self, 'user_id', user_id)
+            dct["user_id"] = mapped_column(
+                ForeignKey(getattr(user_model, user_primary_key_field_name)), nullable=True
+            )
+            dct["set_user_id"] = lambda self, user_id: setattr(self, "user_id", user_id)
 
-        dct['user'] = relationship(user_model, backref="notifications")
-        dct['get_user_id'] = lambda self: self.user_id
-        dct['get_user'] = lambda self: self.user
-        dct['__tablename__'] = "notifications"
-        dct['__tableargs__'] = {"extend_existing": True}
+        dct["user"] = relationship(user_model, backref="notifications")
+        dct["get_user_id"] = lambda self: self.user_id
+        dct["get_user"] = lambda self: self.user
+        dct["__tablename__"] = "notifications"
+        dct["__tableargs__"] = {"extend_existing": True}
 
         return super().__new__(cls, name, bases, dct)
 

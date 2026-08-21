@@ -33,9 +33,7 @@ DEFAULT_BASE_PATH = os.environ.get("VINTASEND_ATTACHMENTS_PATH", "vintasend_atta
 def _resolve_path(storage_identifiers: StorageIdentifiers, fallback_base: Path) -> Path:
     file_id = storage_identifiers.get("id")
     if not file_id:
-        raise UnsupportedAttachmentFileTypeError(
-            "storage_identifiers must carry a non-empty 'id'"
-        )
+        raise UnsupportedAttachmentFileTypeError("storage_identifiers must carry a non-empty 'id'")
     base = storage_identifiers.get("base_path")
     base_path = Path(base) if base else fallback_base
     return base_path / str(file_id)

@@ -9,7 +9,8 @@ Revises: 8b1baef54852
 Create Date: 2026-07-23 00:00:00.000000
 
 """
-from typing import Sequence, Union
+
+from collections.abc import Sequence
 
 from vintasend_sqlalchemy.alembic_initial_migration_ops import (
     create_attachment_tables,
@@ -20,10 +21,10 @@ from vintasend_sqlalchemy.alembic_initial_migration_ops import (
 
 
 # revision identifiers, used by Alembic.
-revision: str = '2b0f1c2d3e4f'
-down_revision: Union[str, None] = '8b1baef54852'
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+revision: str = "2b0f1c2d3e4f"
+down_revision: str | None = "8b1baef54852"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:

@@ -2,9 +2,21 @@ import asyncio
 import datetime
 import uuid
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Generic, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
-from sqlalchemy import ColumnElement, and_, false, func, not_, or_, select, true, update
+from sqlalchemy import (
+    ColumnElement,
+    CursorResult,
+    Result,
+    and_,
+    false,
+    func,
+    not_,
+    or_,
+    select,
+    true,
+    update,
+)
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import Session, joinedload, sessionmaker
@@ -16,6 +28,7 @@ from vintasend.exceptions import (
     NotificationError,
     NotificationNotFoundError,
     NotificationUpdateError,
+    UnconfirmedNotificationUpdateError,
 )
 from vintasend.services.attachment_managers.asyncio_base import AsyncIOBaseAttachmentManager
 from vintasend.services.attachment_managers.base import BaseAttachmentManager
@@ -37,6 +50,7 @@ from vintasend.services.notification_backends.filters import (
     NotificationFilter,
     NotificationOrderBy,
     is_field_filter,
+    is_template_version_value,
 )
 
 from vintasend_sqlalchemy.model_factory import (
@@ -62,6 +76,17 @@ def _utcnow() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
 
 
+def _rowcount(result: "Result[Any]") -> int:
+    # AsyncSession.execute is typed as returning a plain Result, but an UPDATE comes back as a
+    # CursorResult, which is where rowcount lives. Check instead of assuming, so a dialect that
+    # ever returns something else fails here rather than as an AttributeError further down.
+    if not isinstance(result, CursorResult):
+        raise UnconfirmedNotificationUpdateError(
+            f"Expected an UPDATE to return a CursorResult, got {type(result).__name__}"
+        )
+    return result.rowcount
+
+
 # ---------------------------------------------------------------------------- filter translation
 #
 # Filter-field name -> notification ORM column, split by how each is matched. Mirrors the maps in
@@ -76,6 +101,13 @@ _MEMBERSHIP_FIELDS: dict[str, str] = {
     "tenant": "tenant",
 }
 _STRING_LOOKUP_FIELDS = frozenset({"body_template", "subject_template", "context_name"})
+# Integer membership, kept apart from ``_MEMBERSHIP_FIELDS`` because these columns are
+# ``Integer``: a candidate that is not an ``int`` has to be rejected before it reaches
+# ``IN``, where the driver would raise on the bind rather than return no rows.
+_VERSION_FIELDS: dict[str, str] = {
+    "requested_template_version": "requested_template_version",
+    "used_template_version": "used_template_version",
+}
 _RANGE_FIELDS: dict[str, str] = {
     "send_after_range": "send_after",
     "created_at_range": "created",
@@ -150,6 +182,13 @@ def _field_leaf(
     if field in _STRING_LOOKUP_FIELDS:
         column = getattr(model, field)
         return _string_lookup_expr(column, value), column
+    if field in _VERSION_FIELDS:
+        column = getattr(model, _VERSION_FIELDS[field])
+        versions = list(value) if isinstance(value, (list, tuple, set)) else [value]
+        if not all(is_template_version_value(version) for version in versions):
+            # One bad candidate rejects the whole leaf, mirroring the reference evaluator.
+            return false(), None
+        return column.in_(versions), column
     if field in _MEMBERSHIP_FIELDS:
         column = getattr(model, _MEMBERSHIP_FIELDS[field])
         values = value if isinstance(value, (list, tuple, set)) else [value]
@@ -269,6 +308,8 @@ def _user_notification_from_orm(
         read_at=notification.read_at,
         tenant=notification.tenant,
         git_commit_sha=notification.git_commit_sha,
+        requested_template_version=notification.requested_template_version,
+        used_template_version=notification.used_template_version,
         attachments=attachments,
     )
 
@@ -299,6 +340,8 @@ def _one_off_notification_from_orm(
         read_at=notification.read_at,
         tenant=notification.tenant,
         git_commit_sha=notification.git_commit_sha,
+        requested_template_version=notification.requested_template_version,
+        used_template_version=notification.used_template_version,
         attachments=attachments,
     )
 
@@ -341,12 +384,12 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                 self.notification_model_cls.status == NotificationStatus.SENT.value,
                 self.notification_model_cls.notification_type == NotificationTypes.IN_APP.value,
             )
-            .order_by(self.notification_model_cls.created.desc(), self.notification_model_cls.id.desc())
+            .order_by(
+                self.notification_model_cls.created.desc(), self.notification_model_cls.id.desc()
+            )
         )
 
-    def _get_all_in_app_notifications_query(
-        self, session: Session, user_id: int | str | uuid.UUID
-    ):
+    def _get_all_in_app_notifications_query(self, session: Session, user_id: int | str | uuid.UUID):
         return (
             session.query(self.notification_model_cls)
             .where(
@@ -359,7 +402,9 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                 ),
                 self.notification_model_cls.notification_type == NotificationTypes.IN_APP.value,
             )
-            .order_by(self.notification_model_cls.created.desc(), self.notification_model_cls.id.desc())
+            .order_by(
+                self.notification_model_cls.created.desc(), self.notification_model_cls.id.desc()
+            )
         )
 
     def _get_all_future_notifications_query(self, session: Session):
@@ -390,14 +435,18 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
 
     # ---------------------------------------------------------------------- serialization
 
-    def serialize_notification(self, notification: "NotificationModel") -> Notification | OneOffNotification:
+    def serialize_notification(
+        self, notification: "NotificationModel"
+    ) -> Notification | OneOffNotification:
         attachments = list(self.get_attachments(notification.id))
         if getattr(notification, "user_id", None):
             return _user_notification_from_orm(notification, attachments)
         return _one_off_notification_from_orm(notification, attachments)
 
     def serialize_user_notification(self, notification: "NotificationModel") -> Notification:
-        return _user_notification_from_orm(notification, list(self.get_attachments(notification.id)))
+        return _user_notification_from_orm(
+            notification, list(self.get_attachments(notification.id))
+        )
 
     # ---------------------------------------------------------------------- attachments
 
@@ -572,9 +621,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
             )
             return [_serialize_file_record(record) for record in records]
 
-    def get_attachments(
-        self, notification_id: int | str | uuid.UUID
-    ) -> Iterable[StoredAttachment]:
+    def get_attachments(self, notification_id: int | str | uuid.UUID) -> Iterable[StoredAttachment]:
         manager = self._attachment_manager
         with self.session_manager.begin() as session:
             join_rows = (
@@ -645,6 +692,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         adapter_extra_parameters: dict | None = None,
         attachments: list[AnyNotificationAttachment] | None = None,
         tenant: str | None = None,
+        requested_template_version: int | None = None,
     ) -> Notification:
         with self.session_manager.begin() as session:
             notification_instance = self.notification_model_cls(
@@ -660,6 +708,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                 status=NotificationStatus.PENDING_SEND.value,
                 adapter_extra_parameters=adapter_extra_parameters,
                 tenant=tenant,
+                requested_template_version=requested_template_version,
             )
             session.add(notification_instance)
             session.flush()
@@ -686,6 +735,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         adapter_extra_parameters: dict | None = None,
         attachments: list[AnyNotificationAttachment] | None = None,
         tenant: str | None = None,
+        requested_template_version: int | None = None,
     ) -> OneOffNotification:
         with self.session_manager.begin() as session:
             notification_instance = self.notification_model_cls(
@@ -704,6 +754,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                 status=NotificationStatus.PENDING_SEND.value,
                 adapter_extra_parameters=adapter_extra_parameters,
                 tenant=tenant,
+                requested_template_version=requested_template_version,
             )
             session.add(notification_instance)
             session.flush()
@@ -720,9 +771,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         # ``attachments`` is not a scalar column; it is a set of already-stored files to link via
         # join rows (the resend path), so pull it out before the row update.
         update_values = dict(updated_data)
-        attachments = cast(
-            "list[StoredAttachment] | None", update_values.pop("attachments", None)
-        )
+        attachments = cast("list[StoredAttachment] | None", update_values.pop("attachments", None))
 
         with self.session_manager.begin() as session:
             if update_values:
@@ -762,7 +811,9 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
 
         return self.get_notification(notification_id)
 
-    def mark_pending_as_sent(self, notification_id: int | str | uuid.UUID) -> Notification | OneOffNotification:
+    def mark_pending_as_sent(
+        self, notification_id: int | str | uuid.UUID
+    ) -> Notification | OneOffNotification:
         return self._update_notification_status(
             notification_id,
             [NotificationStatus.PENDING_SEND.value],
@@ -770,14 +821,18 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
             extra_values={"sent_at": _utcnow()},
         )
 
-    def mark_pending_as_failed(self, notification_id: int | str | uuid.UUID) -> Notification | OneOffNotification:
+    def mark_pending_as_failed(
+        self, notification_id: int | str | uuid.UUID
+    ) -> Notification | OneOffNotification:
         return self._update_notification_status(
             notification_id,
             [NotificationStatus.PENDING_SEND.value],
             NotificationStatus.FAILED.value,
         )
 
-    def mark_sent_as_read(self, notification_id: int | str | uuid.UUID) -> Notification | OneOffNotification:
+    def mark_sent_as_read(
+        self, notification_id: int | str | uuid.UUID
+    ) -> Notification | OneOffNotification:
         return self._update_notification_status(
             notification_id,
             [NotificationStatus.SENT.value],
@@ -818,7 +873,10 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                     *base_filters,
                     self.notification_model_cls.status == NotificationStatus.READ.value,
                 )
-                .order_by(self.notification_model_cls.created.desc(), self.notification_model_cls.id.desc())
+                .order_by(
+                    self.notification_model_cls.created.desc(),
+                    self.notification_model_cls.id.desc(),
+                )
                 .all()
             )
             session.expunge_all()
@@ -895,7 +953,9 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         with self.session_manager.begin() as session:
             notifications = self._get_all_in_app_unread_notifications_query(session, user_id).all()
             session.expunge_all()
-        return [_user_notification_from_orm(n, list(self.get_attachments(n.id))) for n in notifications]
+        return [
+            _user_notification_from_orm(n, list(self.get_attachments(n.id))) for n in notifications
+        ]
 
     def filter_in_app_unread_notifications(
         self, user_id: int | str | uuid.UUID, page: int = 1, page_size: int = 10
@@ -908,7 +968,9 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                 .all()
             )
             session.expunge_all()
-        return [_user_notification_from_orm(n, list(self.get_attachments(n.id))) for n in notifications]
+        return [
+            _user_notification_from_orm(n, list(self.get_attachments(n.id))) for n in notifications
+        ]
 
     def filter_all_in_app_notifications(
         self, user_id: int | str | uuid.UUID
@@ -916,7 +978,9 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         with self.session_manager.begin() as session:
             notifications = self._get_all_in_app_notifications_query(session, user_id).all()
             session.expunge_all()
-        return [_user_notification_from_orm(n, list(self.get_attachments(n.id))) for n in notifications]
+        return [
+            _user_notification_from_orm(n, list(self.get_attachments(n.id))) for n in notifications
+        ]
 
     def filter_in_app_notifications(
         self, user_id: int | str | uuid.UUID, page: int = 1, page_size: int = 10
@@ -929,7 +993,9 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                 .all()
             )
             session.expunge_all()
-        return [_user_notification_from_orm(n, list(self.get_attachments(n.id))) for n in notifications]
+        return [
+            _user_notification_from_orm(n, list(self.get_attachments(n.id))) for n in notifications
+        ]
 
     def count_in_app_notifications(self, user_id: int | str | uuid.UUID) -> int:
         with self.session_manager.begin() as session:
@@ -1058,6 +1124,18 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                 self.notification_model_cls.id == notification_id
             ).update({"git_commit_sha": git_commit_sha})
 
+    def store_template_version(
+        self,
+        notification_id: int | str | uuid.UUID,
+        template_version: int,
+    ) -> None:
+        # Overridden rather than inherited: the seam's default is a no-op so a backend with
+        # nowhere to put this keeps working, and there is a column for it here.
+        with self.session_manager.begin() as session:
+            session.query(self.notification_model_cls).filter(
+                self.notification_model_cls.id == notification_id
+            ).update({"used_template_version": template_version})
+
 
 class SQLAlchemyAsyncIONotificationBackend(
     Generic[NotificationModel], AsyncIOBaseNotificationBackend
@@ -1075,7 +1153,9 @@ class SQLAlchemyAsyncIONotificationBackend(
         self.notification_model_cls = (
             notification_model_cls if notification_model_cls else self._get_notification_model_cls()
         )
-        self._attachment_manager: AsyncIOBaseAttachmentManager = FilesystemAsyncIOAttachmentManager()
+        self._attachment_manager: AsyncIOBaseAttachmentManager = (
+            FilesystemAsyncIOAttachmentManager()
+        )
 
     def _get_notification_model_cls(self) -> "type[NotificationModel]":
         notification_model_cls = NotificationSettings().get_notification_model_cls()
@@ -1097,7 +1177,9 @@ class SQLAlchemyAsyncIONotificationBackend(
                 self.notification_model_cls.status == NotificationStatus.SENT.value,
                 self.notification_model_cls.notification_type == NotificationTypes.IN_APP.value,
             )
-            .order_by(self.notification_model_cls.created.desc(), self.notification_model_cls.id.desc())
+            .order_by(
+                self.notification_model_cls.created.desc(), self.notification_model_cls.id.desc()
+            )
         )
 
     def _get_all_in_app_notifications_query(self, user_id: int | str | uuid.UUID):
@@ -1113,7 +1195,9 @@ class SQLAlchemyAsyncIONotificationBackend(
                 ),
                 self.notification_model_cls.notification_type == NotificationTypes.IN_APP.value,
             )
-            .order_by(self.notification_model_cls.created.desc(), self.notification_model_cls.id.desc())
+            .order_by(
+                self.notification_model_cls.created.desc(), self.notification_model_cls.id.desc()
+            )
         )
 
     def _get_all_future_notifications_query(self):
@@ -1195,13 +1279,17 @@ class SQLAlchemyAsyncIONotificationBackend(
                     data = manager.file_to_bytes(attachment.file)
                     checksum = manager.calculate_checksum(data)
                     existing = (
-                        await session.execute(
-                            select(AttachmentFileRecordModel).where(
-                                AttachmentFileRecordModel.checksum == checksum,
-                                AttachmentFileRecordModel.size == len(data),
+                        (
+                            await session.execute(
+                                select(AttachmentFileRecordModel).where(
+                                    AttachmentFileRecordModel.checksum == checksum,
+                                    AttachmentFileRecordModel.size == len(data),
+                                )
                             )
                         )
-                    ).scalars().first()
+                        .scalars()
+                        .first()
+                    )
                     if existing is not None:
                         record = existing
                     else:
@@ -1297,20 +1385,22 @@ class SQLAlchemyAsyncIONotificationBackend(
     ) -> AttachmentFileRecordDataclass | None:
         async with self.session_manager() as session:
             instance = (
-                await session.execute(
-                    select(AttachmentFileRecordModel).where(
-                        AttachmentFileRecordModel.checksum == checksum,
-                        AttachmentFileRecordModel.size == size,
+                (
+                    await session.execute(
+                        select(AttachmentFileRecordModel).where(
+                            AttachmentFileRecordModel.checksum == checksum,
+                            AttachmentFileRecordModel.size == size,
+                        )
                     )
                 )
-            ).scalars().first()
+                .scalars()
+                .first()
+            )
             if instance is None:
                 return None
             return _serialize_file_record(instance)
 
-    async def delete_attachment_file(
-        self, file_id: str, lock: asyncio.Lock | None = None
-    ) -> None:
+    async def delete_attachment_file(self, file_id: str, lock: asyncio.Lock | None = None) -> None:
         async with self.session_manager() as session:
             async with session.begin():
                 try:
@@ -1324,12 +1414,16 @@ class SQLAlchemyAsyncIONotificationBackend(
         async with self.session_manager() as session:
             referenced = select(NotificationAttachmentModel.file_id)
             records = (
-                await session.execute(
-                    select(AttachmentFileRecordModel).where(
-                        AttachmentFileRecordModel.id.not_in(referenced)
+                (
+                    await session.execute(
+                        select(AttachmentFileRecordModel).where(
+                            AttachmentFileRecordModel.id.not_in(referenced)
+                        )
                     )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             return [_serialize_file_record(record) for record in records]
 
     async def get_attachments(
@@ -1338,12 +1432,16 @@ class SQLAlchemyAsyncIONotificationBackend(
         manager = self._attachment_manager
         async with self.session_manager() as session:
             join_rows = (
-                await session.execute(
-                    select(NotificationAttachmentModel)
-                    .options(joinedload(NotificationAttachmentModel.file))
-                    .where(NotificationAttachmentModel.notification_id == notification_id)
+                (
+                    await session.execute(
+                        select(NotificationAttachmentModel)
+                        .options(joinedload(NotificationAttachmentModel.file))
+                        .where(NotificationAttachmentModel.notification_id == notification_id)
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             return [_stored_attachment(manager, join_row, join_row.file) for join_row in join_rows]
 
     async def delete_notification_attachment(
@@ -1418,6 +1516,7 @@ class SQLAlchemyAsyncIONotificationBackend(
         adapter_extra_parameters: dict | None = None,
         attachments: list[AnyNotificationAttachment] | None = None,
         tenant: str | None = None,
+        requested_template_version: int | None = None,
         lock: asyncio.Lock | None = None,
     ) -> Notification:
         async with self.session_manager() as session:
@@ -1434,6 +1533,7 @@ class SQLAlchemyAsyncIONotificationBackend(
                 status=NotificationStatus.PENDING_SEND.value,
                 adapter_extra_parameters=adapter_extra_parameters,
                 tenant=tenant,
+                requested_template_version=requested_template_version,
             )
             session.add(notification_instance)
             await session.flush()
@@ -1443,7 +1543,9 @@ class SQLAlchemyAsyncIONotificationBackend(
 
         stored_attachments: list[StoredAttachment] = []
         if attachments:
-            stored_attachments = await self._store_attachments(attachments, notification_instance.id)
+            stored_attachments = await self._store_attachments(
+                attachments, notification_instance.id
+            )
         return _user_notification_from_orm(notification_instance, stored_attachments)
 
     async def persist_one_off_notification(
@@ -1462,6 +1564,7 @@ class SQLAlchemyAsyncIONotificationBackend(
         adapter_extra_parameters: dict | None = None,
         attachments: list[AnyNotificationAttachment] | None = None,
         tenant: str | None = None,
+        requested_template_version: int | None = None,
         lock: asyncio.Lock | None = None,
     ) -> OneOffNotification:
         async with self.session_manager() as session:
@@ -1481,6 +1584,7 @@ class SQLAlchemyAsyncIONotificationBackend(
                 status=NotificationStatus.PENDING_SEND.value,
                 adapter_extra_parameters=adapter_extra_parameters,
                 tenant=tenant,
+                requested_template_version=requested_template_version,
             )
             session.add(notification_instance)
             await session.flush()
@@ -1490,7 +1594,9 @@ class SQLAlchemyAsyncIONotificationBackend(
 
         stored_attachments: list[StoredAttachment] = []
         if attachments:
-            stored_attachments = await self._store_attachments(attachments, notification_instance.id)
+            stored_attachments = await self._store_attachments(
+                attachments, notification_instance.id
+            )
         return _one_off_notification_from_orm(notification_instance, stored_attachments)
 
     async def persist_notification_update(
@@ -1500,13 +1606,11 @@ class SQLAlchemyAsyncIONotificationBackend(
         lock: asyncio.Lock | None = None,
     ) -> Notification | OneOffNotification:
         update_values = dict(updated_data)
-        attachments = cast(
-            "list[StoredAttachment] | None", update_values.pop("attachments", None)
-        )
+        attachments = cast("list[StoredAttachment] | None", update_values.pop("attachments", None))
 
         async with self.session_manager() as session:
             if update_values:
-                records_updated = (
+                records_updated = _rowcount(
                     await session.execute(
                         update(self.notification_model_cls)
                         .where(
@@ -1521,7 +1625,7 @@ class SQLAlchemyAsyncIONotificationBackend(
                             }
                         )
                     )
-                ).rowcount
+                )
                 await session.commit()
                 if records_updated == 0:
                     raise NotificationUpdateError(
@@ -1633,7 +1737,7 @@ class SQLAlchemyAsyncIONotificationBackend(
         self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
     ) -> None:
         async with self.session_manager() as session:
-            records_updated = (
+            records_updated = _rowcount(
                 await session.execute(
                     update(self.notification_model_cls)
                     .where(
@@ -1642,7 +1746,7 @@ class SQLAlchemyAsyncIONotificationBackend(
                     )
                     .values({"status": NotificationStatus.CANCELLED.value})
                 )
-            ).rowcount
+            )
             await session.commit()
         if records_updated == 0:
             raise NotificationCancelError("Failed to delete notification")
@@ -1675,7 +1779,7 @@ class SQLAlchemyAsyncIONotificationBackend(
         if extra_values:
             values.update(extra_values)
         async with self.session_manager() as session:
-            records_updated = (
+            records_updated = _rowcount(
                 await session.execute(
                     update(self.notification_model_cls)
                     .where(
@@ -1684,19 +1788,23 @@ class SQLAlchemyAsyncIONotificationBackend(
                     )
                     .values(values)
                 )
-            ).rowcount
+            )
             await session.commit()
             if records_updated == 0:
                 raise NotificationUpdateError("Failed to update notification status")
 
         async with self.session_manager() as session:
             notification_instance = (
-                await session.execute(
-                    select(self.notification_model_cls).where(
-                        self.notification_model_cls.id == notification_id
+                (
+                    await session.execute(
+                        select(self.notification_model_cls).where(
+                            self.notification_model_cls.id == notification_id
+                        )
                     )
                 )
-            ).scalars().one()
+                .scalars()
+                .one()
+            )
             session.expunge(notification_instance)
         return await self._serialize_notification(notification_instance)
 
@@ -1821,9 +1929,7 @@ class SQLAlchemyAsyncIONotificationBackend(
         async with self.session_manager() as session:
             return (
                 await session.execute(
-                    select(func.count())
-                    .select_from(self.notification_model_cls)
-                    .where(expression)
+                    select(func.count()).select_from(self.notification_model_cls).where(expression)
                 )
             ).scalar() or 0
 
@@ -1861,11 +1967,7 @@ class SQLAlchemyAsyncIONotificationBackend(
     ) -> Iterable["Notification | OneOffNotification"]:
         async with self.session_manager() as session:
             notifications = (
-                (
-                    await session.execute(
-                        self._get_all_future_notifications_from_user_query(user_id)
-                    )
-                )
+                (await session.execute(self._get_all_future_notifications_from_user_query(user_id)))
                 .scalars()
                 .all()
             )
@@ -1939,5 +2041,20 @@ class SQLAlchemyAsyncIONotificationBackend(
                 update(self.notification_model_cls)
                 .where(self.notification_model_cls.id == notification_id)
                 .values(git_commit_sha=git_commit_sha)
+            )
+            await session.commit()
+
+    async def store_template_version(
+        self,
+        notification_id: int | str | uuid.UUID,
+        template_version: int,
+        lock: asyncio.Lock | None = None,
+    ) -> None:
+        # See the sync twin.
+        async with self.session_manager() as session:
+            await session.execute(
+                update(self.notification_model_cls)
+                .where(self.notification_model_cls.id == notification_id)
+                .values(used_template_version=template_version)
             )
             await session.commit()
