@@ -1350,14 +1350,14 @@ zstd = ["backports-zstd (>=1.0.0)"]
 
 [[package]]
 name = "vintasend"
-version = "3.2.0"
+version = "3.3.0"
 description = "A flexible package for implementing transactional notifications"
 optional = false
 python-versions = "<3.15,>=3.10"
 groups = ["main"]
 files = [
-    {file = "vintasend-3.2.0-py3-none-any.whl", hash = "sha256:3d74a80204c0ed281bec1ab4abac4869cbb3716586acac738af4eb4bbaf55b0a"},
-    {file = "vintasend-3.2.0.tar.gz", hash = "sha256:3f48d6d1a7377cee19706c2b01b074c4c2b217514b963b8fd1207aaa692b0c86"},
+    {file = "vintasend-3.3.0-py3-none-any.whl", hash = "sha256:2faace8f4e0e2f8edfeffd43e58dd2f8b8b4564f12654d9f6a18f5772a05fad0"},
+    {file = "vintasend-3.3.0.tar.gz", hash = "sha256:15516b1afa8f6bfdfa84ca914e2a579aeebb98b5944edca56cfe34d9aad77660"},
 ]
 
 [package.dependencies]
@@ -1386,4 +1386,4 @@ typing-extensions = {version = ">=4.13.2", markers = "python_version < \"3.11\""
 [metadata]
 lock-version = "2.1"
 python-versions = "<3.15,>=3.10"
-content-hash = "58c8621fe8123a3fb4abd6c46d02bb383dd62e26dd601469a5ec49b1fa79a374"
+content-hash = "296d2befb3f236d2134288719a335fc7acdc6c10bc1c52b1d65b64954efb3117"
