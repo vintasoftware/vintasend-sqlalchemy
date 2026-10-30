@@ -30,7 +30,7 @@ pytest = "^9.0.3"
 pytest-asyncio = "^1.4.0"
 pytest-xdist = {version = "^3.8.0", extras=["psutil"]}
 pytest-cov = "^7.1.0"
-ruff = "^0.15.22"
+ruff = "^0.17.3"
 mypy = "^2.3.0"
 
 
