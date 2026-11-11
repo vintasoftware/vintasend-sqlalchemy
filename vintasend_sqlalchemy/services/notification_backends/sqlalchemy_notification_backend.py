@@ -21,12 +21,20 @@ from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 from vintasend.app_settings import NotificationSettings
-from vintasend.constants import NotificationStatus, NotificationTypes
+from vintasend.constants import (
+    REPINNABLE_NOTIFICATION_STATUSES,
+    REQUEUEABLE_NOTIFICATION_STATUSES,
+    UNSET,
+    NotificationStatus,
+    NotificationTypes,
+    UnsetType,
+)
 from vintasend.exceptions import (
     AttachmentFileNotFoundError,
     NotificationCancelError,
     NotificationError,
     NotificationNotFoundError,
+    NotificationRequeueError,
     NotificationUpdateError,
     UnconfirmedNotificationUpdateError,
 )
@@ -766,11 +774,11 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         return _one_off_notification_from_orm(notification_instance, stored_attachments)
 
     def persist_notification_update(
-        self, notification_id: int | str | uuid.UUID, updated_data: UpdateNotificationKwargs
+        self, notification_id: int | str | uuid.UUID, update_data: UpdateNotificationKwargs
     ) -> Notification | OneOffNotification:
         # ``attachments`` is not a scalar column; it is a set of already-stored files to link via
         # join rows (the resend path), so pull it out before the row update.
-        update_values = dict(updated_data)
+        update_values = dict(update_data)
         attachments = cast("list[StoredAttachment] | None", update_values.pop("attachments", None))
 
         with self.session_manager.begin() as session:
@@ -779,7 +787,9 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                     session.query(self.notification_model_cls)
                     .filter(
                         self.notification_model_cls.id == notification_id,
-                        self.notification_model_cls.status == NotificationStatus.PENDING_SEND.value,
+                        # A notification that did not go out can be updated: repin_notification
+                        # moves the pin on FAILED and CANCELLED ones too. A delivered one cannot.
+                        self.notification_model_cls.status.in_(REPINNABLE_NOTIFICATION_STATUSES),
                     )
                     .update(
                         {
@@ -797,7 +807,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                     session.query(self.notification_model_cls)
                     .filter(
                         self.notification_model_cls.id == notification_id,
-                        self.notification_model_cls.status == NotificationStatus.PENDING_SEND.value,
+                        self.notification_model_cls.status.in_(REPINNABLE_NOTIFICATION_STATUSES),
                     )
                     .count()
                 )
@@ -896,12 +906,50 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         if records_updated == 0:
             raise NotificationCancelError("Failed to delete notification")
 
+    def requeue_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        send_after: datetime.datetime | UnsetType | None = UNSET,
+    ) -> Notification | OneOffNotification:
+        """Put a FAILED or CANCELLED notification back into PENDING_SEND.
+
+        The status check is part of the UPDATE's WHERE clause, so a notification another caller
+        requeued first, or a worker sent in the meantime, is refused rather than overwritten.
+        """
+        values: dict = {"status": NotificationStatus.PENDING_SEND.value, "sent_at": None}
+        if send_after is not UNSET:
+            values["send_after"] = send_after
+
+        with self.session_manager.begin() as session:
+            records_updated = (
+                session.query(self.notification_model_cls)
+                .filter(
+                    self.notification_model_cls.id == notification_id,
+                    self.notification_model_cls.status.in_(REQUEUEABLE_NOTIFICATION_STATUSES),
+                )
+                .update(values, synchronize_session=False)
+            )
+            if records_updated == 0:
+                exists = (
+                    session.query(self.notification_model_cls)
+                    .filter(self.notification_model_cls.id == notification_id)
+                    .count()
+                )
+                if not exists:
+                    raise NotificationNotFoundError(f"Notification {notification_id} not found")
+                raise NotificationRequeueError(
+                    f"Cannot requeue notification {notification_id}: it is not FAILED or CANCELLED"
+                )
+
+        return self.get_notification(notification_id)
+
     def get_notification(
         self, notification_id: int | str | uuid.UUID, for_update=False
     ) -> Notification | OneOffNotification:
         with self.session_manager.begin() as session:
+            # A cancelled notification is returned too, with status CANCELLED, so it can be read
+            # and requeued. filter_notifications lists cancelled notifications the same way.
             query = session.query(self.notification_model_cls).filter(
-                self.notification_model_cls.status != NotificationStatus.CANCELLED.value,
                 self.notification_model_cls.id == notification_id,
             )
             if for_update:
@@ -1602,10 +1650,10 @@ class SQLAlchemyAsyncIONotificationBackend(
     async def persist_notification_update(
         self,
         notification_id: int | str | uuid.UUID,
-        updated_data: UpdateNotificationKwargs,
+        update_data: UpdateNotificationKwargs,
         lock: asyncio.Lock | None = None,
     ) -> Notification | OneOffNotification:
-        update_values = dict(updated_data)
+        update_values = dict(update_data)
         attachments = cast("list[StoredAttachment] | None", update_values.pop("attachments", None))
 
         async with self.session_manager() as session:
@@ -1615,8 +1663,11 @@ class SQLAlchemyAsyncIONotificationBackend(
                         update(self.notification_model_cls)
                         .where(
                             self.notification_model_cls.id == notification_id,
-                            self.notification_model_cls.status
-                            == NotificationStatus.PENDING_SEND.value,
+                            # A notification that did not go out can be updated:
+                            # repin_notification moves the pin on FAILED and CANCELLED ones too.
+                            self.notification_model_cls.status.in_(
+                                REPINNABLE_NOTIFICATION_STATUSES
+                            ),
                         )
                         .values(
                             {
@@ -1638,8 +1689,9 @@ class SQLAlchemyAsyncIONotificationBackend(
                         .select_from(self.notification_model_cls)
                         .where(
                             self.notification_model_cls.id == notification_id,
-                            self.notification_model_cls.status
-                            == NotificationStatus.PENDING_SEND.value,
+                            self.notification_model_cls.status.in_(
+                                REPINNABLE_NOTIFICATION_STATUSES
+                            ),
                         )
                     )
                 ).scalar()
@@ -1751,12 +1803,56 @@ class SQLAlchemyAsyncIONotificationBackend(
         if records_updated == 0:
             raise NotificationCancelError("Failed to delete notification")
 
+    async def requeue_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        send_after: datetime.datetime | UnsetType | None = UNSET,
+        lock: asyncio.Lock | None = None,
+    ) -> Notification | OneOffNotification:
+        """Put a FAILED or CANCELLED notification back into PENDING_SEND.
+
+        The status check is part of the UPDATE's WHERE clause, so a notification another caller
+        requeued first, or a worker sent in the meantime, is refused rather than overwritten.
+        """
+        values: dict = {"status": NotificationStatus.PENDING_SEND.value, "sent_at": None}
+        if send_after is not UNSET:
+            values["send_after"] = send_after
+
+        async with self.session_manager() as session:
+            records_updated = _rowcount(
+                await session.execute(
+                    update(self.notification_model_cls)
+                    .where(
+                        self.notification_model_cls.id == notification_id,
+                        self.notification_model_cls.status.in_(REQUEUEABLE_NOTIFICATION_STATUSES),
+                    )
+                    .values(values)
+                )
+            )
+            await session.commit()
+            if records_updated == 0:
+                exists = (
+                    await session.execute(
+                        select(func.count())
+                        .select_from(self.notification_model_cls)
+                        .where(self.notification_model_cls.id == notification_id)
+                    )
+                ).scalar()
+                if not exists:
+                    raise NotificationNotFoundError(f"Notification {notification_id} not found")
+                raise NotificationRequeueError(
+                    f"Cannot requeue notification {notification_id}: it is not FAILED or CANCELLED"
+                )
+
+        return await self.get_notification(notification_id)
+
     async def get_notification(
         self, notification_id: int | str | uuid.UUID, for_update=False
     ) -> Notification | OneOffNotification:
         async with self.session_manager() as session:
+            # A cancelled notification is returned too, with status CANCELLED, so it can be read
+            # and requeued. filter_notifications lists cancelled notifications the same way.
             query = select(self.notification_model_cls).where(
-                self.notification_model_cls.status != NotificationStatus.CANCELLED.value,
                 self.notification_model_cls.id == notification_id,
             )
             if for_update:

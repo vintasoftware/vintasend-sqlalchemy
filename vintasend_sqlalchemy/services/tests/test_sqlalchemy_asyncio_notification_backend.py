@@ -113,7 +113,7 @@ async def test_update_notification(
         async_db_session, NotificationModel
     ).persist_notification_update(
         notification_id=notification.id,
-        updated_data=updated_data,
+        update_data=updated_data,
     )
 
     assert updated_notification.subject_template == "updated test subject"
@@ -526,10 +526,11 @@ async def test_get_notification_cancelled(
     await SQLAlchemyAsyncIONotificationBackend(
         async_db_session, NotificationModel
     ).cancel_notification(notification.id)
-    with pytest.raises(NotificationNotFoundError):
-        await SQLAlchemyAsyncIONotificationBackend(
-            async_db_session, NotificationModel
-        ).get_notification(notification.id)
+    # Kept and returned as CANCELLED, so it can be requeued.
+    cancelled = await SQLAlchemyAsyncIONotificationBackend(
+        async_db_session, NotificationModel
+    ).get_notification(notification.id)
+    assert cancelled.status == NotificationStatus.CANCELLED.value
 
     async with async_db_session.begin() as session:
         await session.execute(

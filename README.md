@@ -24,6 +24,20 @@ integer membership, with the same NULL semantics as every other field: a notific
 version never matches positively and is included under negation. See
 [Template Version Pinning](https://github.com/vintasoftware/vintasend#template-version-pinning).
 
+### Requeueing and repinning
+
+Both backends implement `requeue_notification`, which vintasend 3.7.0 added to the backend
+contract. It moves a `FAILED` or `CANCELLED` notification back to `PENDING_SEND` with one
+conditional `UPDATE ... WHERE id = ? AND status IN ('FAILED', 'CANCELLED')`, so two callers
+racing cannot both succeed. It clears `sent_at`, applies `send_after` only when it is passed
+(`None` included), and returns the notification with its attachments. An unknown id raises
+`NotificationNotFoundError`, and any other status raises `NotificationRequeueError`.
+
+A cancelled notification keeps its row with status `CANCELLED`, and `get_notification` returns
+it, so it can be requeued. `persist_notification_update` accepts a `FAILED` or `CANCELLED`
+notification as well as a pending one, which `repin_notification` relies on; a `SENT` or `READ`
+one still raises `NotificationUpdateError`.
+
 ## Backends
 
 ```python
