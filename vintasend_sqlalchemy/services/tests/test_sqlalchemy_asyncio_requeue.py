@@ -236,7 +236,8 @@ async def test_the_service_requeues_a_cancelled_notification_and_sends_it(
 
     requeued = await service.requeue_notification(notification.id, send_after=None)
 
-    assert requeued.status == NotificationStatus.PENDING_SEND.value
+    # The service returns the notification read again after the send it started.
+    assert requeued.status == NotificationStatus.SENT.value
     assert (await backend.get_notification(notification.id)).status == NotificationStatus.SENT.value
 
 

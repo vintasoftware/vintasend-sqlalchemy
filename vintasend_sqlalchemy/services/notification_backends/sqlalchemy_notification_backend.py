@@ -34,8 +34,10 @@ from vintasend.exceptions import (
     NotificationCancelError,
     NotificationError,
     NotificationNotFoundError,
+    NotificationRepinError,
     NotificationRequeueError,
     NotificationUpdateError,
+    NotificationVersionChangedError,
     UnconfirmedNotificationUpdateError,
 )
 from vintasend.services.attachment_managers.asyncio_base import AsyncIOBaseAttachmentManager
@@ -44,6 +46,7 @@ from vintasend.services.dataclasses import (
     AnyNotificationAttachment,
     Notification,
     NotificationAttachment,
+    NotificationVersion,
     OneOffNotification,
     StoredAttachment,
     UpdateNotificationKwargs,
@@ -60,6 +63,7 @@ from vintasend.services.notification_backends.filters import (
     is_field_filter,
     is_template_version_value,
 )
+from vintasend.utils.uuid_utils import uuid7
 
 from vintasend_sqlalchemy.model_factory import (
     AttachmentFileRecord as AttachmentFileRecordModel,
@@ -121,6 +125,12 @@ _RANGE_FIELDS: dict[str, str] = {
     "created_at_range": "created",
     "sent_at_range": "sent_at",
     "read_at_range": "read_at",
+}
+# Presence filters: ``True`` matches a set column, ``False`` a NULL one. Unlike every other leaf,
+# a NULL row is what ``False`` asks for, so a negated presence leaf does not OR in ``IS NULL``.
+_PRESENCE_FIELDS: dict[str, str] = {
+    "has_send_after": "send_after",
+    "has_requested_template_version": "requested_template_version",
 }
 _ORDER_FIELD_TO_COLUMN: dict[str, str] = {
     "send_after": "send_after",
@@ -202,6 +212,12 @@ def _field_leaf(
         values = value if isinstance(value, (list, tuple, set)) else [value]
         normalized = [_normalize_membership_value(v) for v in values]
         return column.in_(normalized), column
+    if field in _PRESENCE_FIELDS:
+        if not isinstance(value, bool):
+            # A non-bool matches nothing, mirroring the reference evaluator.
+            return false(), None
+        column = getattr(model, _PRESENCE_FIELDS[field])
+        return (column.is_not(None) if value else column.is_(None)), None
     return false(), None
 
 
@@ -255,6 +271,59 @@ def build_filter_expression(
                 negated_expr = or_(negated_expr, null_column.is_(None))
             leaf_expressions.append(negated_expr)
     return _or_all(leaf_expressions) if negated else _and_all(leaf_expressions)
+
+
+# ------------------------------------------------------------------------------ version tokens
+
+# Every optional action both backends implement. Listed rather than derived from
+# ``DEFAULT_BACKEND_ACTION_CAPABILITIES`` so a key added to core later is not claimed unread.
+_ACTION_CAPABILITIES: dict[str, bool] = {
+    "repin.expectedVersion": True,
+    "requeue.expectedVersion": True,
+    "requeue.templateVersion": True,
+    "versions.filter": True,
+}
+# The presence filters default to False in core; both backends translate them into SQL.
+_FILTER_CAPABILITIES: dict[str, bool] = {
+    "fields.hasSendAfter": True,
+    "negation.hasSendAfter": True,
+    "fields.hasRequestedTemplateVersion": True,
+    "negation.hasRequestedTemplateVersion": True,
+}
+
+
+def _changed_error(action: str, notification_id: object) -> NotificationVersionChangedError:
+    return NotificationVersionChangedError(
+        f"Cannot {action} notification {notification_id}: it changed since that version was read"
+    )
+
+
+def _version_token(notification_version: uuid.UUID | None) -> str:
+    """The token ``filter_notification_versions`` hands out for a row.
+
+    ``""`` for a row an instance of the previous release inserted during a rolling deploy, before
+    ``finish_notification_table_upgrade_to_3_8`` gave it a token: the row is still listed, and a
+    conditional move of it is refused as changed, because ``""`` is not a token any row holds.
+    """
+    return "" if notification_version is None else str(notification_version)
+
+
+def _parse_expected_version(
+    action: str, notification_id: object, expected_version: str | None
+) -> uuid.UUID | None:
+    """The ``notification_version`` an ``expected_version`` token names, or ``None`` when none
+    was given. A token that is not a UUID was not handed out by this backend and matches no row,
+    so it is refused as changed, after the row is found to exist."""
+    if expected_version is None:
+        return None
+    if isinstance(expected_version, str):
+        try:
+            return uuid.UUID(expected_version)
+        except ValueError:
+            pass
+    # A fresh UUID that no row holds: the conditional UPDATE matches nothing, and its refusal read
+    # reports "not found" before "changed", in the same order as for a well-formed token.
+    return uuid7()
 
 
 # ------------------------------------------------------------------------- dataclass serialization
@@ -529,6 +598,8 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                 session.flush()
                 stored_attachments.append(_stored_attachment(manager, join_row, record))
 
+            self._renew_version(session, notification_id)
+
         return stored_attachments
 
     def _attach_stored_attachments(
@@ -549,6 +620,14 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                         is_inline=attachment.is_inline,
                     )
                 )
+            self._renew_version(session, notification_id)
+
+    def _renew_version(self, session: Session, notification_id: int | str | uuid.UUID) -> None:
+        """Give a notification a fresh version token for a write that changes it through another
+        table: its attachments. Every UPDATE of the notification row sets the token itself."""
+        session.query(self.notification_model_cls).filter(
+            self.notification_model_cls.id == notification_id
+        ).update({"notification_version": uuid7()}, synchronize_session=False)
 
     def _load_file_record(self, session: Session, file_id: object) -> AttachmentFileRecordModel:
         record = None
@@ -652,7 +731,9 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
             except (TypeError, ValueError):
                 return
             if instance is not None:
+                notification_id = instance.notification_id
                 session.delete(instance)
+                self._renew_version(session, notification_id)
 
     # ---------------------------------------------------------------------- persistence
 
@@ -793,8 +874,11 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                     )
                     .update(
                         {
-                            getattr(self.notification_model_cls, k): v
-                            for k, v in update_values.items()
+                            **{
+                                getattr(self.notification_model_cls, k): v
+                                for k, v in update_values.items()
+                            },
+                            self.notification_model_cls.notification_version: uuid7(),
                         }
                     )
                 )
@@ -873,7 +957,13 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                 *base_filters,
                 self.notification_model_cls.status == NotificationStatus.SENT.value,
             ).update(
-                {"status": NotificationStatus.READ.value, "read_at": _utcnow()},
+                # One statement, so every row it reads gets the same new token. A token only
+                # has to differ from the earlier tokens of its own notification, and it does.
+                {
+                    "status": NotificationStatus.READ.value,
+                    "read_at": _utcnow(),
+                    "notification_version": uuid7(),
+                },
                 synchronize_session=False,
             )
 
@@ -900,7 +990,12 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                     self.notification_model_cls.id == notification_id,
                     self.notification_model_cls.status == NotificationStatus.PENDING_SEND.value,
                 )
-                .update({"status": NotificationStatus.CANCELLED.value})
+                .update(
+                    {
+                        "status": NotificationStatus.CANCELLED.value,
+                        "notification_version": uuid7(),
+                    }
+                )
             )
 
         if records_updated == 0:
@@ -910,37 +1005,131 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         self,
         notification_id: int | str | uuid.UUID,
         send_after: datetime.datetime | UnsetType | None = UNSET,
+        *,
+        template_version: int | None = None,
+        expected_version: str | None = None,
     ) -> Notification | OneOffNotification:
-        """Put a FAILED or CANCELLED notification back into PENDING_SEND.
+        """Put a FAILED or CANCELLED notification back into PENDING_SEND, in one conditional
+        UPDATE.
 
         The status check is part of the UPDATE's WHERE clause, so a notification another caller
         requeued first, or a worker sent in the meantime, is refused rather than overwritten.
+        ``template_version`` is written in the same UPDATE, and ``expected_version`` joins the
+        WHERE as ``notification_version``. When the UPDATE matches nothing, the row's id, status
+        and version are read once to say why -- ``NotificationNotFoundError``, then
+        ``NotificationVersionChangedError``, then ``NotificationRequeueError`` -- and nothing is
+        written.
         """
-        values: dict = {"status": NotificationStatus.PENDING_SEND.value, "sent_at": None}
+        expected = _parse_expected_version("requeue", notification_id, expected_version)
+        model = self.notification_model_cls
+        values: dict = {
+            "status": NotificationStatus.PENDING_SEND.value,
+            "sent_at": None,
+            "notification_version": uuid7(),
+        }
         if send_after is not UNSET:
             values["send_after"] = send_after
+        if template_version is not None:
+            values["requested_template_version"] = template_version
+        conditions = [
+            model.id == notification_id,
+            model.status.in_(REQUEUEABLE_NOTIFICATION_STATUSES),
+        ]
+        if expected is not None:
+            conditions.append(model.notification_version == expected)
 
         with self.session_manager.begin() as session:
             records_updated = (
-                session.query(self.notification_model_cls)
-                .filter(
-                    self.notification_model_cls.id == notification_id,
-                    self.notification_model_cls.status.in_(REQUEUEABLE_NOTIFICATION_STATUSES),
-                )
-                .update(values, synchronize_session=False)
+                session.query(model).filter(*conditions).update(values, synchronize_session=False)
             )
             if records_updated == 0:
-                exists = (
-                    session.query(self.notification_model_cls)
-                    .filter(self.notification_model_cls.id == notification_id)
-                    .count()
-                )
-                if not exists:
+                current = session.execute(
+                    select(model.id, model.status, model.notification_version).where(
+                        model.id == notification_id
+                    )
+                ).one_or_none()
+                if current is None:
                     raise NotificationNotFoundError(f"Notification {notification_id} not found")
+                if expected is not None and current.notification_version != expected:
+                    raise _changed_error("requeue", notification_id)
+                if current.status in REQUEUEABLE_NOTIFICATION_STATUSES:
+                    # It qualifies now, so it changed between the UPDATE and this read.
+                    raise _changed_error("requeue", notification_id)
                 raise NotificationRequeueError(
                     f"Cannot requeue notification {notification_id}: it is not FAILED or CANCELLED"
                 )
 
+        return self.get_notification(notification_id)
+
+    def repin_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        template_version: int,
+        *,
+        expected_version: str | None = None,
+    ) -> Notification | OneOffNotification:
+        """Pin a notification to ``template_version`` in one conditional UPDATE.
+
+        The WHERE carries the statuses a pin may still change in (``PENDING_SEND``, ``FAILED``,
+        ``CANCELLED``), ``expected_version`` as ``notification_version`` when given, and "not
+        already pinned to this version", so a notification a worker sends in the meantime is
+        never repinned. Only ``requested_template_version`` (and the version token) change.
+
+        When the UPDATE matches nothing, the row is read once to say why, and nothing is written:
+        ``NotificationNotFoundError``, ``NotificationVersionChangedError`` (written since
+        ``expected_version``), ``NotificationRepinError`` (already delivered), the notification
+        as it is when it is already on ``template_version``, or
+        ``NotificationVersionChangedError`` when it matched every condition on that second look,
+        having changed between the two statements.
+        """
+        expected = _parse_expected_version("repin", notification_id, expected_version)
+        model = self.notification_model_cls
+        conditions = [
+            model.id == notification_id,
+            model.status.in_(REPINNABLE_NOTIFICATION_STATUSES),
+            # ``!=`` alone is never true for NULL, so an unpinned row is named too.
+            or_(
+                model.requested_template_version.is_(None),
+                model.requested_template_version != template_version,
+            ),
+        ]
+        if expected is not None:
+            conditions.append(model.notification_version == expected)
+
+        with self.session_manager.begin() as session:
+            records_updated = (
+                session.query(model)
+                .filter(*conditions)
+                .update(
+                    {
+                        "requested_template_version": template_version,
+                        "notification_version": uuid7(),
+                    },
+                    synchronize_session=False,
+                )
+            )
+            if records_updated == 0:
+                current = session.execute(
+                    select(model).where(model.id == notification_id)
+                ).scalar_one_or_none()
+                if current is None:
+                    raise NotificationNotFoundError(f"Notification {notification_id} not found")
+                if expected is not None and current.notification_version != expected:
+                    raise _changed_error("repin", notification_id)
+                if current.status not in REPINNABLE_NOTIFICATION_STATUSES:
+                    raise NotificationRepinError(
+                        f"Cannot repin notification {notification_id}: it has already been "
+                        "delivered"
+                    )
+                if current.requested_template_version != template_version:
+                    raise _changed_error("repin", notification_id)
+                session.expunge(current)
+                unchanged = current
+            else:
+                unchanged = None
+
+        if unchanged is not None:
+            return self.serialize_notification(unchanged)
         return self.get_notification(notification_id)
 
     def get_notification(
@@ -969,7 +1158,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         extra_values: dict | None = None,
     ) -> Notification | OneOffNotification:
         with self.session_manager.begin() as session:
-            values: dict = {"status": new_status}
+            values: dict = {"status": new_status, "notification_version": uuid7()}
             if extra_values:
                 values.update(extra_values)
             records_updated = (
@@ -1087,9 +1276,42 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         with self.session_manager.begin() as session:
             return session.query(self.notification_model_cls).filter(expression).count()
 
+    def filter_notification_versions(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        page: int,
+        page_size: int,
+    ) -> list[NotificationVersion]:
+        """The ID and version token of every notification matching ``filter``, ordered by ID,
+        ``page`` 1-indexed.
+
+        Selects ``id`` and ``notification_version`` and nothing else: no recipient, context,
+        context parameters, rendered content or attachment is read. ``version`` is the
+        ``notification_version`` UUID as a string; pass it as ``expected_version`` to act on the
+        notification only while it is unchanged.
+        """
+        model = self.notification_model_cls
+        expression = build_filter_expression(model, filter)
+        with self.session_manager.begin() as session:
+            rows = session.execute(
+                select(model.id, model.notification_version)
+                .where(expression)
+                .order_by(model.id)
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            ).all()
+        return [
+            NotificationVersion(id=row.id, version=_version_token(row.notification_version))
+            for row in rows
+        ]
+
     def get_filter_capabilities(self) -> dict[str, bool]:
-        # This backend translates the full vocabulary into SQL, so it declines nothing.
-        return {}
+        # This backend translates the full vocabulary into SQL, so it declines nothing, and it
+        # claims the presence filters, which core defaults to unsupported.
+        return dict(_FILTER_CAPABILITIES)
+
+    def get_action_capabilities(self) -> dict[str, bool]:
+        return dict(_ACTION_CAPABILITIES)
 
     def get_all_future_notifications(self) -> Iterable["Notification | OneOffNotification"]:
         with self.session_manager.begin() as session:
@@ -1160,7 +1382,13 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         with self.session_manager.begin() as session:
             session.query(self.notification_model_cls).filter(
                 self.notification_model_cls.id == notification_id
-            ).update({"context_used": context, "adapter_used": adapter_import_str})
+            ).update(
+                {
+                    "context_used": context,
+                    "adapter_used": adapter_import_str,
+                    "notification_version": uuid7(),
+                }
+            )
 
     def store_git_commit_sha(
         self,
@@ -1170,7 +1398,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         with self.session_manager.begin() as session:
             session.query(self.notification_model_cls).filter(
                 self.notification_model_cls.id == notification_id
-            ).update({"git_commit_sha": git_commit_sha})
+            ).update({"git_commit_sha": git_commit_sha, "notification_version": uuid7()})
 
     def store_template_version(
         self,
@@ -1182,7 +1410,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         with self.session_manager.begin() as session:
             session.query(self.notification_model_cls).filter(
                 self.notification_model_cls.id == notification_id
-            ).update({"used_template_version": template_version})
+            ).update({"used_template_version": template_version, "notification_version": uuid7()})
 
 
 class SQLAlchemyAsyncIONotificationBackend(
@@ -1364,6 +1592,8 @@ class SQLAlchemyAsyncIONotificationBackend(
                     await session.flush()
                     stored_attachments.append(_stored_attachment(manager, join_row, record))
 
+                await self._renew_version(session, notification_id)
+
         return stored_attachments
 
     async def _attach_stored_attachments(
@@ -1384,6 +1614,17 @@ class SQLAlchemyAsyncIONotificationBackend(
                             is_inline=attachment.is_inline,
                         )
                     )
+                await self._renew_version(session, notification_id)
+
+    async def _renew_version(
+        self, session: AsyncSession, notification_id: int | str | uuid.UUID
+    ) -> None:
+        """See the sync twin."""
+        await session.execute(
+            update(self.notification_model_cls)
+            .where(self.notification_model_cls.id == notification_id)
+            .values(notification_version=uuid7())
+        )
 
     async def _load_file_record(
         self, session: AsyncSession, file_id: object
@@ -1502,7 +1743,9 @@ class SQLAlchemyAsyncIONotificationBackend(
                 except (TypeError, ValueError):
                     return
                 if instance is not None:
+                    notification_id = instance.notification_id
                     await session.delete(instance)
+                    await self._renew_version(session, notification_id)
 
     # ---------------------------------------------------------------------- persistence
 
@@ -1671,8 +1914,11 @@ class SQLAlchemyAsyncIONotificationBackend(
                         )
                         .values(
                             {
-                                getattr(self.notification_model_cls, k): v
-                                for k, v in update_values.items()
+                                **{
+                                    getattr(self.notification_model_cls, k): v
+                                    for k, v in update_values.items()
+                                },
+                                self.notification_model_cls.notification_version: uuid7(),
                             }
                         )
                     )
@@ -1761,7 +2007,12 @@ class SQLAlchemyAsyncIONotificationBackend(
                     *base_filters,
                     self.notification_model_cls.status == NotificationStatus.SENT.value,
                 )
-                .values(status=NotificationStatus.READ.value, read_at=_utcnow())
+                # See the sync twin: one statement, one new token for every row it reads.
+                .values(
+                    status=NotificationStatus.READ.value,
+                    read_at=_utcnow(),
+                    notification_version=uuid7(),
+                )
             )
             await session.commit()
 
@@ -1796,7 +2047,12 @@ class SQLAlchemyAsyncIONotificationBackend(
                         self.notification_model_cls.id == notification_id,
                         self.notification_model_cls.status == NotificationStatus.PENDING_SEND.value,
                     )
-                    .values({"status": NotificationStatus.CANCELLED.value})
+                    .values(
+                        {
+                            "status": NotificationStatus.CANCELLED.value,
+                            "notification_version": uuid7(),
+                        }
+                    )
                 )
             )
             await session.commit()
@@ -1808,42 +2064,114 @@ class SQLAlchemyAsyncIONotificationBackend(
         notification_id: int | str | uuid.UUID,
         send_after: datetime.datetime | UnsetType | None = UNSET,
         lock: asyncio.Lock | None = None,
+        *,
+        template_version: int | None = None,
+        expected_version: str | None = None,
     ) -> Notification | OneOffNotification:
-        """Put a FAILED or CANCELLED notification back into PENDING_SEND.
-
-        The status check is part of the UPDATE's WHERE clause, so a notification another caller
-        requeued first, or a worker sent in the meantime, is refused rather than overwritten.
-        """
-        values: dict = {"status": NotificationStatus.PENDING_SEND.value, "sent_at": None}
+        """Put a FAILED or CANCELLED notification back into PENDING_SEND, in one conditional
+        UPDATE. See the sync twin for the WHERE clause and the refusals."""
+        expected = _parse_expected_version("requeue", notification_id, expected_version)
+        model = self.notification_model_cls
+        values: dict = {
+            "status": NotificationStatus.PENDING_SEND.value,
+            "sent_at": None,
+            "notification_version": uuid7(),
+        }
         if send_after is not UNSET:
             values["send_after"] = send_after
+        if template_version is not None:
+            values["requested_template_version"] = template_version
+        conditions = [
+            model.id == notification_id,
+            model.status.in_(REQUEUEABLE_NOTIFICATION_STATUSES),
+        ]
+        if expected is not None:
+            conditions.append(model.notification_version == expected)
 
         async with self.session_manager() as session:
-            records_updated = _rowcount(
-                await session.execute(
-                    update(self.notification_model_cls)
-                    .where(
-                        self.notification_model_cls.id == notification_id,
-                        self.notification_model_cls.status.in_(REQUEUEABLE_NOTIFICATION_STATUSES),
-                    )
-                    .values(values)
+            async with session.begin():
+                records_updated = _rowcount(
+                    await session.execute(update(model).where(*conditions).values(values))
                 )
-            )
-            await session.commit()
-            if records_updated == 0:
-                exists = (
-                    await session.execute(
-                        select(func.count())
-                        .select_from(self.notification_model_cls)
-                        .where(self.notification_model_cls.id == notification_id)
+                if records_updated == 0:
+                    current = (
+                        await session.execute(
+                            select(model.id, model.status, model.notification_version).where(
+                                model.id == notification_id
+                            )
+                        )
+                    ).one_or_none()
+                    if current is None:
+                        raise NotificationNotFoundError(f"Notification {notification_id} not found")
+                    if expected is not None and current.notification_version != expected:
+                        raise _changed_error("requeue", notification_id)
+                    if current.status in REQUEUEABLE_NOTIFICATION_STATUSES:
+                        # It qualifies now, so it changed between the UPDATE and this read.
+                        raise _changed_error("requeue", notification_id)
+                    raise NotificationRequeueError(
+                        f"Cannot requeue notification {notification_id}: it is not FAILED or "
+                        "CANCELLED"
                     )
-                ).scalar()
-                if not exists:
-                    raise NotificationNotFoundError(f"Notification {notification_id} not found")
-                raise NotificationRequeueError(
-                    f"Cannot requeue notification {notification_id}: it is not FAILED or CANCELLED"
-                )
 
+        return await self.get_notification(notification_id)
+
+    async def repin_notification(
+        self,
+        notification_id: int | str | uuid.UUID,
+        template_version: int,
+        *,
+        expected_version: str | None = None,
+        lock: asyncio.Lock | None = None,
+    ) -> Notification | OneOffNotification:
+        """Pin a notification to ``template_version`` in one conditional UPDATE. See the sync
+        twin for the WHERE clause and the refusals."""
+        expected = _parse_expected_version("repin", notification_id, expected_version)
+        model = self.notification_model_cls
+        conditions = [
+            model.id == notification_id,
+            model.status.in_(REPINNABLE_NOTIFICATION_STATUSES),
+            or_(
+                model.requested_template_version.is_(None),
+                model.requested_template_version != template_version,
+            ),
+        ]
+        if expected is not None:
+            conditions.append(model.notification_version == expected)
+
+        async with self.session_manager() as session:
+            async with session.begin():
+                records_updated = _rowcount(
+                    await session.execute(
+                        update(model)
+                        .where(*conditions)
+                        .values(
+                            requested_template_version=template_version,
+                            notification_version=uuid7(),
+                        )
+                    )
+                )
+                if records_updated == 0:
+                    current = (
+                        await session.execute(select(model).where(model.id == notification_id))
+                    ).scalar_one_or_none()
+                    if current is None:
+                        raise NotificationNotFoundError(f"Notification {notification_id} not found")
+                    if expected is not None and current.notification_version != expected:
+                        raise _changed_error("repin", notification_id)
+                    if current.status not in REPINNABLE_NOTIFICATION_STATUSES:
+                        raise NotificationRepinError(
+                            f"Cannot repin notification {notification_id}: it has already been "
+                            "delivered"
+                        )
+                    if current.requested_template_version != template_version:
+                        raise _changed_error("repin", notification_id)
+                    session.expunge(current)
+                    unchanged = current
+                else:
+                    unchanged = None
+
+        if unchanged is not None:
+            return await self._serialize_notification(unchanged)
         return await self.get_notification(notification_id)
 
     async def get_notification(
@@ -1871,7 +2199,7 @@ class SQLAlchemyAsyncIONotificationBackend(
         new_status: str,
         extra_values: dict | None = None,
     ) -> Notification | OneOffNotification:
-        values: dict = {"status": new_status}
+        values: dict = {"status": new_status, "notification_version": uuid7()}
         if extra_values:
             values.update(extra_values)
         async with self.session_manager() as session:
@@ -2029,8 +2357,40 @@ class SQLAlchemyAsyncIONotificationBackend(
                 )
             ).scalar() or 0
 
+    async def filter_notification_versions(
+        self,
+        filter: NotificationFilter,  # noqa: A002
+        page: int,
+        page_size: int,
+    ) -> list[NotificationVersion]:
+        """The ID and version token of every notification matching ``filter``, ordered by ID,
+        ``page`` 1-indexed.
+
+        Selects ``id`` and ``notification_version`` and nothing else: no recipient, context,
+        context parameters, rendered content or attachment is read. See the sync twin.
+        """
+        model = self.notification_model_cls
+        expression = build_filter_expression(model, filter)
+        async with self.session_manager() as session:
+            rows = (
+                await session.execute(
+                    select(model.id, model.notification_version)
+                    .where(expression)
+                    .order_by(model.id)
+                    .offset((page - 1) * page_size)
+                    .limit(page_size)
+                )
+            ).all()
+        return [
+            NotificationVersion(id=row.id, version=_version_token(row.notification_version))
+            for row in rows
+        ]
+
     async def get_filter_capabilities(self) -> dict[str, bool]:
-        return {}
+        return dict(_FILTER_CAPABILITIES)
+
+    async def get_action_capabilities(self) -> dict[str, bool]:
+        return dict(_ACTION_CAPABILITIES)
 
     async def get_all_future_notifications(self) -> Iterable["Notification | OneOffNotification"]:
         async with self.session_manager() as session:
@@ -2122,7 +2482,11 @@ class SQLAlchemyAsyncIONotificationBackend(
             await session.execute(
                 update(self.notification_model_cls)
                 .where(self.notification_model_cls.id == notification_id)
-                .values(context_used=context, adapter_used=adapter_import_str)
+                .values(
+                    context_used=context,
+                    adapter_used=adapter_import_str,
+                    notification_version=uuid7(),
+                )
             )
             await session.commit()
 
@@ -2136,7 +2500,7 @@ class SQLAlchemyAsyncIONotificationBackend(
             await session.execute(
                 update(self.notification_model_cls)
                 .where(self.notification_model_cls.id == notification_id)
-                .values(git_commit_sha=git_commit_sha)
+                .values(git_commit_sha=git_commit_sha, notification_version=uuid7())
             )
             await session.commit()
 
@@ -2151,6 +2515,6 @@ class SQLAlchemyAsyncIONotificationBackend(
             await session.execute(
                 update(self.notification_model_cls)
                 .where(self.notification_model_cls.id == notification_id)
-                .values(used_template_version=template_version)
+                .values(used_template_version=template_version, notification_version=uuid7())
             )
             await session.commit()

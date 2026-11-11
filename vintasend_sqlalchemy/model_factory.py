@@ -11,9 +11,11 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Uuid,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.orm.decl_api import DeclarativeAttributeIntercept
+from vintasend.utils.uuid_utils import uuid7
 
 
 def _utcnow() -> datetime.datetime:
@@ -83,6 +85,16 @@ class NotificationMixin(Base):
     # moved on by the time anyone asks.
     used_template_version: Mapped[int | None] = mapped_column(
         "used_template_version", Integer, nullable=True
+    )
+
+    # The version token ``filter_notification_versions`` hands out and ``requeue_notification`` /
+    # ``repin_notification`` check as ``expected_version``. A fresh UUIDv7 on every write: the
+    # backend sets it explicitly in every UPDATE it issues, and ``default`` / ``onupdate`` cover
+    # an insert and an UPDATE made through this model (ORM flush or a Core ``update()``). A write
+    # that bypasses the model, such as raw SQL, must set it too, or ``expected_version`` cannot
+    # see that write. ``Uuid`` is native on PostgreSQL and ``CHAR(32)`` elsewhere.
+    notification_version: Mapped[uuid.UUID] = mapped_column(
+        "notification_version", Uuid, nullable=False, default=uuid7, onupdate=uuid7
     )
 
     # Email specific fields

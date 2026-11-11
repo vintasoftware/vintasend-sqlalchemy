@@ -79,6 +79,92 @@ def downgrade_notification_table_from_2_1(user_id_type: type = sa.Integer):
         batch_op.drop_column("requested_template_version")
 
 
+def upgrade_notification_table_to_3_8(batch_size: int = 1000, *, not_null: bool = True):
+    """Add the ``notification_version`` column to an existing ``notifications`` table.
+
+    ``notification_version`` is the version token ``filter_notification_versions`` hands out and
+    ``requeue_notification`` / ``repin_notification`` check as ``expected_version``: a UUIDv7
+    that every write to the notification replaces.
+
+    Three steps: add the column as nullable (skipped when it already exists, so a run that failed
+    part-way on a database without transactional DDL can be repeated), give every row without a
+    token its own fresh UUIDv7, then make the column ``NOT NULL``. The backfill works
+    ``batch_size`` rows at a time and reads only ``id`` -- no recipient, context or content is
+    selected. It needs a live connection, so it refuses Alembic's offline (``--sql``) mode.
+
+    For a rolling deploy, where instances running the previous release keep inserting rows without
+    the column, pass ``not_null=False`` here and call
+    ``finish_notification_table_upgrade_to_3_8()`` in a later revision, once none is left.
+    """
+    _require_online_migration()
+    bind = op.get_bind()
+    columns = {column["name"] for column in sa.inspect(bind).get_columns("notifications")}
+    if "notification_version" not in columns:
+        with op.batch_alter_table("notifications") as batch_op:
+            batch_op.add_column(sa.Column("notification_version", sa.Uuid(), nullable=True))
+    if not_null:
+        finish_notification_table_upgrade_to_3_8(batch_size)
+    else:
+        _backfill_notification_versions(batch_size)
+
+
+def finish_notification_table_upgrade_to_3_8(batch_size: int = 1000):
+    """Give every row still without a ``notification_version`` one, then make it ``NOT NULL``.
+
+    The second half of ``upgrade_notification_table_to_3_8(not_null=False)``: run it once no
+    instance of the previous release is writing, so it also covers the rows they inserted in
+    between. Running it on a table that is already done changes nothing but the constraint.
+    """
+    _require_online_migration()
+    _backfill_notification_versions(batch_size)
+    with op.batch_alter_table("notifications") as batch_op:
+        batch_op.alter_column("notification_version", existing_type=sa.Uuid(), nullable=False)
+
+
+def _require_online_migration() -> None:
+    if op.get_context().as_sql:
+        raise RuntimeError(
+            "The notification_version backfill reads and writes rows, so it needs a live "
+            "database connection: run this migration online, not with --sql."
+        )
+
+
+def _backfill_notification_versions(batch_size: int) -> None:
+    from vintasend.utils.uuid_utils import uuid7
+
+    notifications = sa.table(
+        "notifications",
+        sa.column("id", sa.BigInteger().with_variant(sa.Integer, "sqlite")),
+        sa.column("notification_version", sa.Uuid()),
+    )
+    backfill = (
+        sa.update(notifications)
+        .where(notifications.c.id == sa.bindparam("row_id"))
+        .where(notifications.c.notification_version.is_(None))
+        .values(notification_version=sa.bindparam("row_version"))
+    )
+    bind = op.get_bind()
+    while True:
+        ids = (
+            bind.execute(
+                sa.select(notifications.c.id)
+                .where(notifications.c.notification_version.is_(None))
+                .order_by(notifications.c.id)
+                .limit(batch_size)
+            )
+            .scalars()
+            .all()
+        )
+        if not ids:
+            break
+        bind.execute(backfill, [{"row_id": row_id, "row_version": uuid7()} for row_id in ids])
+
+
+def downgrade_notification_table_from_3_8():
+    with op.batch_alter_table("notifications") as batch_op:
+        batch_op.drop_column("notification_version")
+
+
 def create_attachment_tables():
     """Create the ``attachment_file_records`` and ``notification_attachments`` tables.
 
