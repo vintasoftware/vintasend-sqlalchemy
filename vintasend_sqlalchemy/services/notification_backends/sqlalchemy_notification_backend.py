@@ -1,23 +1,27 @@
 import asyncio
 import datetime
 import uuid
-from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
+from collections.abc import Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Final, Generic, TypeVar, cast
 
 from sqlalchemy import (
     ColumnElement,
     CursorResult,
     Result,
+    Uuid,
     and_,
+    case,
     false,
     func,
+    literal,
     not_,
     or_,
     select,
     true,
     update,
 )
-from sqlalchemy.exc import NoResultFound
+from sqlalchemy import inspect as sqlalchemy_inspect
+from sqlalchemy.exc import DBAPIError, IntegrityError, NoResultFound
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 from vintasend.app_settings import NotificationSettings
@@ -44,6 +48,7 @@ from vintasend.services.attachment_managers.asyncio_base import AsyncIOBaseAttac
 from vintasend.services.attachment_managers.base import BaseAttachmentManager
 from vintasend.services.dataclasses import (
     AnyNotificationAttachment,
+    ApplyResult,
     Notification,
     NotificationAttachment,
     NotificationVersion,
@@ -78,6 +83,8 @@ from vintasend_sqlalchemy.services.attachment_managers.filesystem import (
 
 
 if TYPE_CHECKING:
+    from sqlalchemy.types import TypeEngine
+
     from vintasend_sqlalchemy.model_factory import NotificationMixin
 
 
@@ -282,6 +289,7 @@ _ACTION_CAPABILITIES: dict[str, bool] = {
     "requeue.expectedVersion": True,
     "requeue.templateVersion": True,
     "versions.filter": True,
+    "writes.notificationVersion": True,
 }
 # The presence filters default to False in core; both backends translate them into SQL.
 _FILTER_CAPABILITIES: dict[str, bool] = {
@@ -324,6 +332,312 @@ def _parse_expected_version(
     # A fresh UUID that no row holds: the conditional UPDATE matches nothing, and its refusal read
     # reports "not found" before "changed", in the same order as for a well-formed token.
     return uuid7()
+
+
+def _given_version(notification_version: str | None) -> uuid.UUID | None:
+    """The token a write was handed, or ``None`` when it was handed none it can store.
+
+    ``notification_version`` is the primary's token, which the service hands a replica reporting
+    ``writes.notificationVersion`` so the replica's row ends on it instead of on a token of its
+    own. A string that is not a UUID is not a token this backend could hand out, and counts as
+    none.
+    """
+    if isinstance(notification_version, str):
+        try:
+            return uuid.UUID(notification_version)
+        except ValueError:
+            return None
+    return None
+
+
+def _held_version(notification_version: str | None) -> uuid.UUID:
+    """The token a write leaves on the row it changes: the one it was handed (see
+    ``_given_version``), or a fresh UUIDv7, as every write mints without the keyword."""
+    return _given_version(notification_version) or uuid7()
+
+
+def _token_or_none(notification_version: uuid.UUID | None) -> str | None:
+    """The ``notification_version`` a returned dataclass carries: the row's token, or ``None``
+    for a row an instance of the previous release inserted without one."""
+    return None if notification_version is None else str(notification_version)
+
+
+# Returned by ``_storable`` for a value the column cannot hold.
+_UNSTORABLE: Final = object()
+
+
+def _storable(column_type: "TypeEngine[Any]", value: object) -> object:
+    """``value`` as a column of ``column_type`` stores it, or ``_UNSTORABLE``.
+
+    Ids cross backends as whatever the primary uses: an integer primary key here may be handed a
+    UUID string by a primary of another kind. Digit strings that round-trip (``"12"``, not
+    ``"012"``) become integers, so an id the primary returned as a string still lands on the
+    same row; anything else that is not already the column's type is refused rather than cast.
+    """
+    if value is None:
+        return None
+    try:
+        python_type = column_type.python_type
+    except NotImplementedError:
+        return value
+    if isinstance(value, bool):
+        return _UNSTORABLE
+    if isinstance(value, python_type):
+        return value
+    if python_type is int and isinstance(value, str):
+        try:
+            parsed = int(value)
+        except ValueError:
+            return _UNSTORABLE
+        return parsed if str(parsed) == value else _UNSTORABLE
+    if python_type is uuid.UUID and isinstance(value, str):
+        try:
+            return uuid.UUID(value)
+        except ValueError:
+            return _UNSTORABLE
+    if python_type is str and isinstance(value, (int, uuid.UUID)):
+        return str(value)
+    return _UNSTORABLE
+
+
+def _column_type(model: "type[NotificationModel]", attribute: str) -> "TypeEngine[Any]":
+    return sqlalchemy_inspect(model).columns[attribute].type
+
+
+def _held_versions_by_id(
+    model: "type[NotificationModel]", notification_versions: Mapping[Any, str] | None
+) -> dict[object, uuid.UUID]:
+    """A bulk write's ``notification_versions``, keyed by the ids as this backend stores them.
+
+    The keys are the ids as the primary returned them, so they are read as strings and stored as
+    the id column's type; one that cannot be an id here names no row and is dropped.
+    """
+    id_type = _column_type(model, "id")
+    held: dict[object, uuid.UUID] = {}
+    for key, token in (notification_versions or {}).items():
+        notification_id = _storable(id_type, str(key))
+        if notification_id is not _UNSTORABLE:
+            held[notification_id] = _held_version(token)
+    return held
+
+
+def _bulk_version_value(
+    model: "type[NotificationModel]", held: dict[object, uuid.UUID], fresh: uuid.UUID
+) -> Any:
+    """The value a bulk UPDATE sets ``notification_version`` to: the held token per row, by id,
+    and ``fresh`` for every other row, in the one statement."""
+    if not held:
+        return fresh
+    return case(
+        {notification_id: literal(token, Uuid()) for notification_id, token in held.items()},
+        value=model.id,
+        else_=literal(fresh, Uuid()),
+    )
+
+
+def _snapshot_keys(
+    model: "type[NotificationModel]", snapshot: Notification | OneOffNotification
+) -> tuple[object, object] | ApplyResult:
+    """The snapshot's id and user id as this backend stores them, or the refusal to apply it.
+
+    The reason names the notification by id only.
+    """
+    notification_id = _storable(_column_type(model, "id"), snapshot.id)
+    if notification_id is None or notification_id is _UNSTORABLE:
+        return ApplyResult(
+            applied=False,
+            reason=f"Notification {snapshot.id} has an id this backend's id column cannot hold",
+        )
+    if isinstance(snapshot, OneOffNotification):
+        return notification_id, None
+    user_id = _storable(_column_type(model, model.get_user_id_attr_name()), snapshot.user_id)
+    if user_id is _UNSTORABLE:
+        return ApplyResult(
+            applied=False,
+            reason=(
+                f"Notification {snapshot.id} has a user id this backend's user id column "
+                "cannot hold"
+            ),
+        )
+    return notification_id, user_id
+
+
+class SnapshotApplyDatabaseError(NotificationError):
+    """The database refused a replication snapshot (a foreign key, a constraint, a lost
+    connection).
+
+    Raised by ``apply_replication_snapshot_if_newer`` in place of SQLAlchemy's ``DBAPIError``,
+    whose text carries the statement's ``[parameters: ...]`` -- titles, recipients, contexts.
+    The message names the notification by id and the error by class only, and the original is
+    neither chained as ``__cause__`` nor kept as ``__context__``, so logging this error (as the
+    service does, with its traceback) writes no field value.
+    """
+
+
+def _snapshot_apply_failed(
+    snapshot: Notification | OneOffNotification, error: DBAPIError
+) -> SnapshotApplyDatabaseError:
+    return SnapshotApplyDatabaseError(
+        f"Notification {snapshot.id}: the database refused the replication snapshot "
+        f"({type(error).__name__})"
+    )
+
+
+def _naive_utc(value: datetime.datetime | None) -> datetime.datetime | None:
+    """``value`` as the naive UTC the ``DateTime`` columns hold: an aware one converted to UTC
+    and stripped of its offset, a naive one left as is (it is UTC already).
+
+    The columns are timezone-naive, so an aware value would be stored, and compared, by its
+    wall clock: ``10:00-03:00`` as ``10:00`` instead of ``13:00``.
+    """
+    if value is None or value.tzinfo is None:
+        return value
+    return value.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+
+
+def _snapshot_values(
+    model: "type[NotificationModel]",
+    snapshot: Notification | OneOffNotification,
+    user_id: object,
+) -> dict[str, Any]:
+    """Every persisted column of the snapshot, ``created`` and ``modified`` included.
+
+    ``modified`` is the primary's, not this backend's clock: the next newer-wins comparison is
+    against it. Every datetime is stored as naive UTC (see ``_naive_utc``). The version token is
+    left out; the caller sets it.
+    """
+    values: dict[str, Any] = {
+        "notification_type": snapshot.notification_type,
+        "title": snapshot.title,
+        "body_template": snapshot.body_template,
+        "context_name": snapshot.context_name,
+        "context_kwargs": snapshot.context_kwargs,
+        "send_after": _naive_utc(snapshot.send_after),
+        "subject_template": snapshot.subject_template,
+        "preheader_template": snapshot.preheader_template,
+        "status": snapshot.status,
+        "context_used": snapshot.context_used,
+        "adapter_used": snapshot.adapter_used,
+        "adapter_extra_parameters": snapshot.adapter_extra_parameters,
+        "sent_at": _naive_utc(snapshot.sent_at),
+        "read_at": _naive_utc(snapshot.read_at),
+        "tenant": snapshot.tenant,
+        "git_commit_sha": snapshot.git_commit_sha,
+        "requested_template_version": snapshot.requested_template_version,
+        "used_template_version": snapshot.used_template_version,
+    }
+    if isinstance(snapshot, OneOffNotification):
+        values[model.get_user_id_attr_name()] = None
+        values["email_or_phone"] = snapshot.email_or_phone
+        values["first_name"] = snapshot.first_name
+        values["last_name"] = snapshot.last_name
+    else:
+        values[model.get_user_id_attr_name()] = user_id
+        values["email_or_phone"] = ""
+        values["first_name"] = ""
+        values["last_name"] = ""
+    if snapshot.created is not None:
+        values["created"] = _naive_utc(snapshot.created)
+    if snapshot.modified is not None:
+        values["updated"] = _naive_utc(snapshot.modified)
+    return values
+
+
+def _snapshot_update_conditions(
+    model: "type[NotificationModel]",
+    notification_id: object,
+    snapshot: Notification | OneOffNotification,
+) -> "list[ColumnElement[bool]]":
+    """The WHERE of a snapshot's conditional UPDATE: the row, and only while it is not newer than
+    the snapshot. An equal ``modified`` applies, and a NULL on either side applies. ``modified``
+    is compared as naive UTC, as the column holds it (see ``_naive_utc``)."""
+    conditions: list[ColumnElement[bool]] = [model.id == notification_id]
+    modified = _naive_utc(snapshot.modified)
+    if modified is not None:
+        conditions.append(or_(model.updated.is_(None), model.updated <= modified))
+    return conditions
+
+
+def _hold_repin_version(
+    model: "type[NotificationModel]",
+    notification_id: object,
+    current: "NotificationModel",
+    held: uuid.UUID,
+) -> Any:
+    """The token-only UPDATE a repin to the pin a notification already has issues when it is
+    handed a token: it matches only while the row is as the repin read it, and keeps
+    ``updated``, since nothing but the token changes."""
+    return (
+        update(model)
+        .where(
+            model.id == notification_id,
+            model.status.in_(REPINNABLE_NOTIFICATION_STATUSES),
+            model.requested_template_version == current.requested_template_version,
+            model.notification_version == current.notification_version,
+        )
+        .values(notification_version=held, updated=model.updated)
+        .execution_options(synchronize_session=False)
+    )
+
+
+def _newer_here(snapshot: Notification | OneOffNotification) -> ApplyResult:
+    """The decline for a row newer here than the snapshot: ``superseded``, so the service does
+    not replay the older snapshot over it."""
+    return ApplyResult(
+        applied=False,
+        reason=f"Notification {snapshot.id} is newer in this backend than the snapshot",
+        superseded=True,
+    )
+
+
+def _snapshot_update(
+    model: "type[NotificationModel]",
+    notification_id: object,
+    snapshot: Notification | OneOffNotification,
+    values: dict[str, Any],
+) -> Any:
+    """The conditional UPDATE that refreshes a row with the snapshot unless the row is newer."""
+    return (
+        update(model)
+        .where(*_snapshot_update_conditions(model, notification_id, snapshot))
+        .values(values)
+        .execution_options(synchronize_session=False)
+    )
+
+
+def _take_join_row(
+    join_rows: list[NotificationAttachmentModel], file_id: int, attachment: StoredAttachment
+) -> NotificationAttachmentModel | None:
+    """Remove and return the join row that best stands for ``attachment``: one on the same file
+    with the same ``is_inline`` and ``description`` first, then any on the same file."""
+    for exact in (True, False):
+        for join_row in join_rows:
+            if join_row.file_id != file_id:
+                continue
+            if exact and (
+                join_row.is_inline != attachment.is_inline
+                or join_row.description != attachment.description
+            ):
+                continue
+            join_rows.remove(join_row)
+            return join_row
+    return None
+
+
+def _snapshot_file_record(attachment: StoredAttachment) -> AttachmentFileRecordModel:
+    """A file record for a snapshot attachment this backend has no record of.
+
+    Built from the snapshot's metadata and ``storage_identifiers`` alone: the bytes are in the
+    attachment manager's storage, which the primary and this backend share, so nothing is read
+    or copied.
+    """
+    return AttachmentFileRecordModel(
+        filename=attachment.filename,
+        content_type=attachment.content_type or "",
+        size=attachment.size,
+        checksum=attachment.checksum,
+        storage_identifiers=dict(attachment.storage_identifiers or {}),
+    )
 
 
 # ------------------------------------------------------------------------- dataclass serialization
@@ -388,6 +702,7 @@ def _user_notification_from_orm(
         requested_template_version=notification.requested_template_version,
         used_template_version=notification.used_template_version,
         attachments=attachments,
+        notification_version=_token_or_none(notification.notification_version),
     )
 
 
@@ -420,6 +735,7 @@ def _one_off_notification_from_orm(
         requested_template_version=notification.requested_template_version,
         used_template_version=notification.used_template_version,
         attachments=attachments,
+        notification_version=_token_or_none(notification.notification_version),
     )
 
 
@@ -428,16 +744,35 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
     notification_model_cls: "type[NotificationModel]"
 
     def __init__(
-        self, session: sessionmaker[Session], notification_model_cls: "type[NotificationModel]"
+        self,
+        session: sessionmaker[Session],
+        notification_model_cls: "type[NotificationModel]",
+        *,
+        backend_identifier: str | None = None,
     ) -> None:
-        super().__init__(session == session, notification_model_cls=notification_model_cls)
+        # Recorded in backend_kwargs only when given, so a backend rebuilt from them keeps it and
+        # one built without it serializes exactly as before.
+        identifier_kwargs = (
+            {} if backend_identifier is None else {"backend_identifier": backend_identifier}
+        )
+        super().__init__(
+            session == session, notification_model_cls=notification_model_cls, **identifier_kwargs
+        )
         self.session_manager = session
+        self.backend_identifier = backend_identifier
         self.notification_model_cls = (
             notification_model_cls if notification_model_cls else self._get_notification_model_cls()
         )
         # Default to a filesystem-backed manager so the backend is usable standalone; the
         # service replaces this through inject_attachment_manager when one is configured.
         self._attachment_manager: BaseAttachmentManager = FilesystemAttachmentManager()
+
+    def get_backend_identifier(self) -> str | None:
+        """The ``backend_identifier`` this backend was built with, or ``None`` for the service's
+        positional ``backend-{n}``. Give each backend of a multi-backend service a stable one
+        (a region, a database name) so routing and listings do not shift if they are reordered.
+        """
+        return self.backend_identifier
 
     def _get_notification_model_cls(self) -> "type[NotificationModel]":
         notification_model_cls = NotificationSettings().get_notification_model_cls()
@@ -531,6 +866,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         self,
         attachments: list[AnyNotificationAttachment],
         notification_id: int | str | uuid.UUID,
+        notification_version: uuid.UUID | None = None,
     ) -> list[StoredAttachment]:
         """Persist attachments, delegating every byte operation to the injected manager.
 
@@ -598,7 +934,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                 session.flush()
                 stored_attachments.append(_stored_attachment(manager, join_row, record))
 
-            self._renew_version(session, notification_id)
+            self._renew_version(session, notification_id, notification_version)
 
         return stored_attachments
 
@@ -606,6 +942,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         self,
         notification_id: int | str | uuid.UUID,
         attachments: list[StoredAttachment],
+        notification_version: uuid.UUID | None = None,
     ) -> None:
         """Link already-stored files to a notification by writing join rows only (resend path)."""
         with self.session_manager.begin() as session:
@@ -620,14 +957,24 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                         is_inline=attachment.is_inline,
                     )
                 )
-            self._renew_version(session, notification_id)
+            self._renew_version(session, notification_id, notification_version)
 
-    def _renew_version(self, session: Session, notification_id: int | str | uuid.UUID) -> None:
-        """Give a notification a fresh version token for a write that changes it through another
-        table: its attachments. Every UPDATE of the notification row sets the token itself."""
+    def _renew_version(
+        self,
+        session: Session,
+        notification_id: int | str | uuid.UUID,
+        notification_version: uuid.UUID | None = None,
+    ) -> None:
+        """Give a notification a new version token for a write that changes it through another
+        table: its attachments. Every UPDATE of the notification row sets the token itself.
+
+        The token is ``notification_version`` when the write was handed one, and a fresh UUIDv7
+        otherwise."""
         session.query(self.notification_model_cls).filter(
             self.notification_model_cls.id == notification_id
-        ).update({"notification_version": uuid7()}, synchronize_session=False)
+        ).update(
+            {"notification_version": notification_version or uuid7()}, synchronize_session=False
+        )
 
     def _load_file_record(self, session: Session, file_id: object) -> AttachmentFileRecordModel:
         record = None
@@ -719,11 +1066,14 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
             )
             return [_stored_attachment(manager, join_row, join_row.file) for join_row in join_rows]
 
-    def delete_notification_attachment(self, attachment_id: int | str | uuid.UUID) -> None:
+    def delete_notification_attachment(
+        self, attachment_id: int | str | uuid.UUID, *, notification_version: str | None = None
+    ) -> None:
         """Delete a single notification attachment join row by its own id.
 
         Drops only the join row, never the ``AttachmentFileRecord`` or its bytes -- a file may
-        still back other notifications.
+        still back other notifications. The notification it belonged to gets a new version token,
+        ``notification_version`` when given (``writes.notificationVersion``).
         """
         with self.session_manager.begin() as session:
             try:
@@ -733,7 +1083,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
             if instance is not None:
                 notification_id = instance.notification_id
                 session.delete(instance)
-                self._renew_version(session, notification_id)
+                self._renew_version(session, notification_id, _held_version(notification_version))
 
     # ---------------------------------------------------------------------- persistence
 
@@ -782,6 +1132,8 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         attachments: list[AnyNotificationAttachment] | None = None,
         tenant: str | None = None,
         requested_template_version: int | None = None,
+        *,
+        notification_version: str | None = None,
     ) -> Notification:
         with self.session_manager.begin() as session:
             notification_instance = self.notification_model_cls(
@@ -798,6 +1150,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                 adapter_extra_parameters=adapter_extra_parameters,
                 tenant=tenant,
                 requested_template_version=requested_template_version,
+                notification_version=_held_version(notification_version),
             )
             session.add(notification_instance)
             session.flush()
@@ -805,7 +1158,13 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
 
         stored_attachments: list[StoredAttachment] = []
         if attachments:
-            stored_attachments = self._store_attachments(attachments, notification_instance.id)
+            # Linking the attachments is a second write, which moves the token again; the
+            # returned notification carries the one the row ends on.
+            attachment_version = _held_version(notification_version)
+            stored_attachments = self._store_attachments(
+                attachments, notification_instance.id, attachment_version
+            )
+            notification_instance.notification_version = attachment_version
         return _user_notification_from_orm(notification_instance, stored_attachments)
 
     def persist_one_off_notification(
@@ -825,6 +1184,8 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         attachments: list[AnyNotificationAttachment] | None = None,
         tenant: str | None = None,
         requested_template_version: int | None = None,
+        *,
+        notification_version: str | None = None,
     ) -> OneOffNotification:
         with self.session_manager.begin() as session:
             notification_instance = self.notification_model_cls(
@@ -844,6 +1205,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                 adapter_extra_parameters=adapter_extra_parameters,
                 tenant=tenant,
                 requested_template_version=requested_template_version,
+                notification_version=_held_version(notification_version),
             )
             session.add(notification_instance)
             session.flush()
@@ -851,19 +1213,33 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
 
         stored_attachments: list[StoredAttachment] = []
         if attachments:
-            stored_attachments = self._store_attachments(attachments, notification_instance.id)
+            # Linking the attachments is a second write, which moves the token again; the
+            # returned notification carries the one the row ends on.
+            attachment_version = _held_version(notification_version)
+            stored_attachments = self._store_attachments(
+                attachments, notification_instance.id, attachment_version
+            )
+            notification_instance.notification_version = attachment_version
         return _one_off_notification_from_orm(notification_instance, stored_attachments)
 
     def persist_notification_update(
-        self, notification_id: int | str | uuid.UUID, update_data: UpdateNotificationKwargs
+        self,
+        notification_id: int | str | uuid.UUID,
+        update_data: UpdateNotificationKwargs,
+        *,
+        notification_version: str | None = None,
     ) -> Notification | OneOffNotification:
         # ``attachments`` is not a scalar column; it is a set of already-stored files to link via
         # join rows (the resend path), so pull it out before the row update.
         update_values = dict(update_data)
         attachments = cast("list[StoredAttachment] | None", update_values.pop("attachments", None))
 
+        given = _given_version(notification_version)
         with self.session_manager.begin() as session:
-            if update_values:
+            if not update_values and not attachments and given is not None:
+                self._stamp_version(session, notification_id, given)
+            # A given token is a write on its own: the row has to end on it.
+            elif update_values or given is not None:
                 records_updated = (
                     session.query(self.notification_model_cls)
                     .filter(
@@ -878,7 +1254,9 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                                 getattr(self.notification_model_cls, k): v
                                 for k, v in update_values.items()
                             },
-                            self.notification_model_cls.notification_version: uuid7(),
+                            self.notification_model_cls.notification_version: _held_version(
+                                notification_version
+                            ),
                         }
                     )
                 )
@@ -901,47 +1279,87 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                     )
 
         if attachments:
-            self._attach_stored_attachments(notification_id, attachments)
+            self._attach_stored_attachments(
+                notification_id, attachments, _held_version(notification_version)
+            )
 
         return self.get_notification(notification_id)
 
+    def _stamp_version(
+        self, session: Session, notification_id: int | str | uuid.UUID, token: uuid.UUID
+    ) -> None:
+        """The token-only write: an empty ``update_data`` with a ``notification_version``.
+
+        It is how the service stamps a replica row it converged with the primary's token, so it
+        is accepted in any status, ``SENT`` and ``READ`` included, unlike an update that changes
+        anything. Only the token changes: ``updated`` is set to itself, so its onupdate does not
+        move it, and the next newer-wins comparison still sees the row's last real write.
+        """
+        model = self.notification_model_cls
+        stamped = _rowcount(
+            session.execute(
+                update(model)
+                .where(model.id == notification_id)
+                .values(notification_version=token, updated=model.updated)
+                .execution_options(synchronize_session=False)
+            )
+        )
+        if stamped == 0:
+            raise NotificationUpdateError(
+                f"Failed to update notification {notification_id}: it does not exist"
+            )
+
     def mark_pending_as_sent(
-        self, notification_id: int | str | uuid.UUID
+        self, notification_id: int | str | uuid.UUID, *, notification_version: str | None = None
     ) -> Notification | OneOffNotification:
         return self._update_notification_status(
             notification_id,
             [NotificationStatus.PENDING_SEND.value],
             NotificationStatus.SENT.value,
             extra_values={"sent_at": _utcnow()},
+            notification_version=notification_version,
         )
 
     def mark_pending_as_failed(
-        self, notification_id: int | str | uuid.UUID
+        self, notification_id: int | str | uuid.UUID, *, notification_version: str | None = None
     ) -> Notification | OneOffNotification:
         return self._update_notification_status(
             notification_id,
             [NotificationStatus.PENDING_SEND.value],
             NotificationStatus.FAILED.value,
+            notification_version=notification_version,
         )
 
     def mark_sent_as_read(
-        self, notification_id: int | str | uuid.UUID
+        self, notification_id: int | str | uuid.UUID, *, notification_version: str | None = None
     ) -> Notification | OneOffNotification:
         return self._update_notification_status(
             notification_id,
             [NotificationStatus.SENT.value],
             NotificationStatus.READ.value,
             extra_values={"read_at": _utcnow()},
+            notification_version=notification_version,
         )
 
     def mark_sent_as_read_bulk(
         self,
         notification_ids: Iterable[int | str | uuid.UUID],
         user_id: int | str | uuid.UUID | None = None,
+        *,
+        notification_versions: Mapping[int | str | uuid.UUID, str] | None = None,
     ) -> Iterable[Notification]:
+        """Mark the SENT notifications among ``notification_ids`` READ, in one UPDATE.
+
+        ``notification_versions`` (``writes.notificationVersion``) maps ids, as the primary
+        returned them, to the token each row is left on; every other row the UPDATE reads gets
+        one fresh token. A mapped row that is already READ is not written again, but takes its
+        token, keeping its ``read_at`` and ``updated``, so it too ends on the token it was
+        handed.
+        """
         ids = list(notification_ids)
         if not ids:
             return []
+        held = _held_versions_by_id(self.notification_model_cls, notification_versions)
 
         with self.session_manager.begin() as session:
             base_filters = [self.notification_model_cls.id.in_(ids)]
@@ -953,18 +1371,34 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                     )
                     == user_id
                 )
-            session.query(self.notification_model_cls).filter(
-                *base_filters,
-                self.notification_model_cls.status == NotificationStatus.SENT.value,
-            ).update(
-                # One statement, so every row it reads gets the same new token. A token only
-                # has to differ from the earlier tokens of its own notification, and it does.
-                {
-                    "status": NotificationStatus.READ.value,
-                    "read_at": _utcnow(),
-                    "notification_version": uuid7(),
-                },
-                synchronize_session=False,
+            model = self.notification_model_cls
+            if held:
+                # Before the UPDATE below, so it reaches only the rows that were READ already.
+                session.execute(
+                    update(model)
+                    .where(
+                        *base_filters,
+                        model.id.in_(list(held)),
+                        model.status == NotificationStatus.READ.value,
+                    )
+                    .values(
+                        notification_version=_bulk_version_value(model, held, uuid7()),
+                        updated=model.updated,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+            session.execute(
+                update(model)
+                .where(*base_filters, model.status == NotificationStatus.SENT.value)
+                # One statement, so every row it reads without a held token gets the same new
+                # one. A token only has to differ from the earlier tokens of its own
+                # notification, and it does.
+                .values(
+                    status=NotificationStatus.READ.value,
+                    read_at=_utcnow(),
+                    notification_version=_bulk_version_value(model, held, uuid7()),
+                )
+                .execution_options(synchronize_session=False)
             )
 
             read_rows = (
@@ -982,7 +1416,9 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
             session.expunge_all()
         return [_user_notification_from_orm(n, list(self.get_attachments(n.id))) for n in read_rows]
 
-    def cancel_notification(self, notification_id: int | str | uuid.UUID) -> None:
+    def cancel_notification(
+        self, notification_id: int | str | uuid.UUID, *, notification_version: str | None = None
+    ) -> None:
         with self.session_manager.begin() as session:
             records_updated = (
                 session.query(self.notification_model_cls)
@@ -993,7 +1429,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                 .update(
                     {
                         "status": NotificationStatus.CANCELLED.value,
-                        "notification_version": uuid7(),
+                        "notification_version": _held_version(notification_version),
                     }
                 )
             )
@@ -1008,6 +1444,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         *,
         template_version: int | None = None,
         expected_version: str | None = None,
+        notification_version: str | None = None,
     ) -> Notification | OneOffNotification:
         """Put a FAILED or CANCELLED notification back into PENDING_SEND, in one conditional
         UPDATE.
@@ -1018,14 +1455,15 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         WHERE as ``notification_version``. When the UPDATE matches nothing, the row's id, status
         and version are read once to say why -- ``NotificationNotFoundError``, then
         ``NotificationVersionChangedError``, then ``NotificationRequeueError`` -- and nothing is
-        written.
+        written. ``expected_version`` is checked against the token the row holds before the
+        write; ``notification_version`` (``writes.notificationVersion``) is the one it leaves.
         """
         expected = _parse_expected_version("requeue", notification_id, expected_version)
         model = self.notification_model_cls
         values: dict = {
             "status": NotificationStatus.PENDING_SEND.value,
             "sent_at": None,
-            "notification_version": uuid7(),
+            "notification_version": _held_version(notification_version),
         }
         if send_after is not UNSET:
             values["send_after"] = send_after
@@ -1067,6 +1505,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         template_version: int,
         *,
         expected_version: str | None = None,
+        notification_version: str | None = None,
     ) -> Notification | OneOffNotification:
         """Pin a notification to ``template_version`` in one conditional UPDATE.
 
@@ -1081,6 +1520,10 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         as it is when it is already on ``template_version``, or
         ``NotificationVersionChangedError`` when it matched every condition on that second look,
         having changed between the two statements.
+
+        ``notification_version`` (``writes.notificationVersion``) is the token the row is left
+        on. A notification already on ``template_version`` takes it too, in a token-only UPDATE
+        under the same conditions, since the row must end on the token it was handed.
         """
         expected = _parse_expected_version("repin", notification_id, expected_version)
         model = self.notification_model_cls
@@ -1103,7 +1546,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                 .update(
                     {
                         "requested_template_version": template_version,
-                        "notification_version": uuid7(),
+                        "notification_version": _held_version(notification_version),
                     },
                     synchronize_session=False,
                 )
@@ -1124,6 +1567,17 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                 if current.requested_template_version != template_version:
                     raise _changed_error("repin", notification_id)
                 session.expunge(current)
+                held = _held_version(notification_version)
+                if (
+                    _given_version(notification_version) is not None
+                    and current.notification_version != held
+                ):
+                    held_rows = _rowcount(
+                        session.execute(_hold_repin_version(model, notification_id, current, held))
+                    )
+                    if held_rows == 0:
+                        raise _changed_error("repin", notification_id)
+                    current.notification_version = held
                 unchanged = current
             else:
                 unchanged = None
@@ -1156,9 +1610,13 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         expected_current_statuses: list[str],
         new_status: str,
         extra_values: dict | None = None,
+        notification_version: str | None = None,
     ) -> Notification | OneOffNotification:
         with self.session_manager.begin() as session:
-            values: dict = {"status": new_status, "notification_version": uuid7()}
+            values: dict = {
+                "status": new_status,
+                "notification_version": _held_version(notification_version),
+            }
             if extra_values:
                 values.update(extra_values)
             records_updated = (
@@ -1378,6 +1836,8 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         notification_id: int | str | uuid.UUID,
         context: dict,
         adapter_import_str: str,
+        *,
+        notification_version: str | None = None,
     ) -> None:
         with self.session_manager.begin() as session:
             session.query(self.notification_model_cls).filter(
@@ -1386,7 +1846,7 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
                 {
                     "context_used": context,
                     "adapter_used": adapter_import_str,
-                    "notification_version": uuid7(),
+                    "notification_version": _held_version(notification_version),
                 }
             )
 
@@ -1394,23 +1854,200 @@ class SQLAlchemyNotificationBackend(Generic[NotificationModel], BaseNotification
         self,
         notification_id: int | str | uuid.UUID,
         git_commit_sha: str,
+        *,
+        notification_version: str | None = None,
     ) -> None:
         with self.session_manager.begin() as session:
             session.query(self.notification_model_cls).filter(
                 self.notification_model_cls.id == notification_id
-            ).update({"git_commit_sha": git_commit_sha, "notification_version": uuid7()})
+            ).update(
+                {
+                    "git_commit_sha": git_commit_sha,
+                    "notification_version": _held_version(notification_version),
+                }
+            )
 
     def store_template_version(
         self,
         notification_id: int | str | uuid.UUID,
         template_version: int,
+        *,
+        notification_version: str | None = None,
     ) -> None:
         # Overridden rather than inherited: the seam's default is a no-op so a backend with
         # nowhere to put this keeps working, and there is a column for it here.
         with self.session_manager.begin() as session:
             session.query(self.notification_model_cls).filter(
                 self.notification_model_cls.id == notification_id
-            ).update({"used_template_version": template_version, "notification_version": uuid7()})
+            ).update(
+                {
+                    "used_template_version": template_version,
+                    "notification_version": _held_version(notification_version),
+                }
+            )
+
+    # ---------------------------------------------------------------------- replication
+
+    def apply_replication_snapshot_if_newer(
+        self, snapshot: Notification | OneOffNotification
+    ) -> ApplyResult:
+        """Upsert the primary's snapshot under its own id, unless this backend's row is newer.
+
+        One transaction, so on any failure nothing is written:
+
+        * the row is refreshed by one conditional UPDATE whose WHERE carries
+          ``updated <= snapshot.modified`` (equal applies; a NULL on either side applies), so a
+          newer row written concurrently is never overwritten. When it matches nothing because
+          the row is newer, nothing is written and ``applied`` is ``False``;
+        * an absent row is inserted with the snapshot's id and every persisted field, its
+          ``created`` and ``modified`` included: the next newer-wins comparison is against the
+          primary's clock, not this backend's;
+        * the attachments are made to match ``snapshot.attachments``: each file is found here by
+          ``(checksum, size)`` or recorded from the snapshot's metadata and
+          ``storage_identifiers``, and join rows are added, updated and removed to match. This
+          assumes the attachment manager's storage is shared by the primary and this backend,
+          as the bytes are never read or copied;
+        * last, the row takes the snapshot's ``notification_version``, so tokens listed here
+          are ones the primary accepts. One is minted only when the snapshot has none, or one
+          that is not a UUID.
+
+        A row newer here than the snapshot is declined with ``superseded=True``, so the service
+        does not replay the older snapshot over it. An id (or user id) this backend's column
+        cannot hold, say a UUID string for an integer primary key, is declined with
+        ``applied=False`` and nothing is written. Reasons name the notification by id only.
+
+        The insert runs in a savepoint: when another apply inserts the same id between this
+        one's UPDATE and its insert, the insert's ``IntegrityError`` rolls back the savepoint
+        only, and the conditional UPDATE runs again against the row now there, applying or
+        declining as ``superseded`` by the same newer-wins rule.
+
+        Any other database error is raised as ``SnapshotApplyDatabaseError``, naming the
+        notification by id and the error by class, with the original (whose text carries the
+        statement's parameters) neither chained nor kept as context.
+        """
+        model = self.notification_model_cls
+        keys = _snapshot_keys(model, snapshot)
+        if isinstance(keys, ApplyResult):
+            return keys
+        notification_id, user_id = keys
+        try:
+            return self._apply_snapshot(snapshot, notification_id, user_id)
+        except DBAPIError as error:
+            failure = _snapshot_apply_failed(snapshot, error)
+        # Raised outside the ``except``, so the original is not even the implicit ``__context__``.
+        raise failure from None
+
+    def _apply_snapshot(
+        self,
+        snapshot: Notification | OneOffNotification,
+        notification_id: object,
+        user_id: object,
+    ) -> ApplyResult:
+        model = self.notification_model_cls
+        values = _snapshot_values(model, snapshot, user_id)
+        token = _held_version(snapshot.notification_version)
+
+        with self.session_manager.begin() as session:
+            refreshed = _rowcount(
+                session.execute(_snapshot_update(model, notification_id, snapshot, values))
+            )
+            if refreshed == 0:
+                if self._snapshot_row_exists(session, notification_id):
+                    return _newer_here(snapshot)
+                inserted = self._insert_snapshot_row(
+                    session,
+                    notification_id,
+                    model(id=notification_id, notification_version=token, **values),
+                )
+                if not inserted:
+                    # Another apply inserted the row first: newer-wins against it.
+                    refreshed = _rowcount(
+                        session.execute(_snapshot_update(model, notification_id, snapshot, values))
+                    )
+                    if refreshed == 0:
+                        return _newer_here(snapshot)
+            self._reconcile_snapshot_attachments(session, notification_id, snapshot.attachments)
+            # Last: nothing written after this may move the token off the primary's. ``updated``
+            # is set to itself so its onupdate does not replace the snapshot's ``modified``.
+            session.execute(
+                update(model)
+                .where(model.id == notification_id)
+                .values(notification_version=token, updated=model.updated)
+                .execution_options(synchronize_session=False)
+            )
+        return ApplyResult(applied=True)
+
+    def _snapshot_row_exists(self, session: Session, notification_id: object) -> bool:
+        model = self.notification_model_cls
+        return (
+            session.execute(select(model.id).where(model.id == notification_id)).one_or_none()
+            is not None
+        )
+
+    def _insert_snapshot_row(
+        self, session: Session, notification_id: object, row: "NotificationModel"
+    ) -> bool:
+        """Insert the snapshot's row in a savepoint. ``False`` when its id was taken meanwhile;
+        any other integrity failure (a missing user, say) is raised."""
+        try:
+            with session.begin_nested():
+                session.add(row)
+                session.flush()
+        except IntegrityError:
+            if self._snapshot_row_exists(session, notification_id):
+                return False
+            raise
+        return True
+
+    def _reconcile_snapshot_attachments(
+        self,
+        session: Session,
+        notification_id: object,
+        attachments: list[StoredAttachment],
+    ) -> None:
+        """Make the notification's join rows match ``attachments``, writing file records for
+        files this backend has no record of. Never touches the bytes."""
+        join_rows = list(
+            session.execute(
+                select(NotificationAttachmentModel)
+                .where(NotificationAttachmentModel.notification_id == notification_id)
+                .order_by(NotificationAttachmentModel.id)
+            ).scalars()
+        )
+        for attachment in attachments:
+            record = (
+                session.execute(
+                    select(AttachmentFileRecordModel)
+                    .where(
+                        AttachmentFileRecordModel.checksum == attachment.checksum,
+                        AttachmentFileRecordModel.size == attachment.size,
+                    )
+                    .order_by(AttachmentFileRecordModel.id)
+                    .limit(1)
+                )
+                .scalars()
+                .first()
+            )
+            if record is None:
+                record = _snapshot_file_record(attachment)
+                session.add(record)
+                session.flush()
+            join_row = _take_join_row(join_rows, record.id, attachment)
+            if join_row is None:
+                session.add(
+                    NotificationAttachmentModel(
+                        notification_id=notification_id,
+                        file_id=record.id,
+                        description=attachment.description,
+                        is_inline=attachment.is_inline,
+                    )
+                )
+            else:
+                join_row.description = attachment.description
+                join_row.is_inline = attachment.is_inline
+        for stale in join_rows:
+            session.delete(stale)
+        session.flush()
 
 
 class SQLAlchemyAsyncIONotificationBackend(
@@ -1423,15 +2060,28 @@ class SQLAlchemyAsyncIONotificationBackend(
         self,
         session: async_sessionmaker[AsyncSession],
         notification_model_cls: "type[NotificationModel]",
+        *,
+        backend_identifier: str | None = None,
     ) -> None:
-        super().__init__(session=session, notification_model_cls=notification_model_cls)
+        # See the sync twin.
+        identifier_kwargs = (
+            {} if backend_identifier is None else {"backend_identifier": backend_identifier}
+        )
+        super().__init__(
+            session=session, notification_model_cls=notification_model_cls, **identifier_kwargs
+        )
         self.session_manager = session
+        self.backend_identifier = backend_identifier
         self.notification_model_cls = (
             notification_model_cls if notification_model_cls else self._get_notification_model_cls()
         )
         self._attachment_manager: AsyncIOBaseAttachmentManager = (
             FilesystemAsyncIOAttachmentManager()
         )
+
+    def get_backend_identifier(self) -> str | None:
+        """See the sync twin."""
+        return self.backend_identifier
 
     def _get_notification_model_cls(self) -> "type[NotificationModel]":
         notification_model_cls = NotificationSettings().get_notification_model_cls()
@@ -1530,6 +2180,7 @@ class SQLAlchemyAsyncIONotificationBackend(
         self,
         attachments: list[AnyNotificationAttachment],
         notification_id: int | str | uuid.UUID,
+        notification_version: uuid.UUID | None = None,
     ) -> list[StoredAttachment]:
         manager = self._attachment_manager
         stored_attachments: list[StoredAttachment] = []
@@ -1592,7 +2243,7 @@ class SQLAlchemyAsyncIONotificationBackend(
                     await session.flush()
                     stored_attachments.append(_stored_attachment(manager, join_row, record))
 
-                await self._renew_version(session, notification_id)
+                await self._renew_version(session, notification_id, notification_version)
 
         return stored_attachments
 
@@ -1600,6 +2251,7 @@ class SQLAlchemyAsyncIONotificationBackend(
         self,
         notification_id: int | str | uuid.UUID,
         attachments: list[StoredAttachment],
+        notification_version: uuid.UUID | None = None,
     ) -> None:
         async with self.session_manager() as session:
             async with session.begin():
@@ -1614,16 +2266,19 @@ class SQLAlchemyAsyncIONotificationBackend(
                             is_inline=attachment.is_inline,
                         )
                     )
-                await self._renew_version(session, notification_id)
+                await self._renew_version(session, notification_id, notification_version)
 
     async def _renew_version(
-        self, session: AsyncSession, notification_id: int | str | uuid.UUID
+        self,
+        session: AsyncSession,
+        notification_id: int | str | uuid.UUID,
+        notification_version: uuid.UUID | None = None,
     ) -> None:
         """See the sync twin."""
         await session.execute(
             update(self.notification_model_cls)
             .where(self.notification_model_cls.id == notification_id)
-            .values(notification_version=uuid7())
+            .values(notification_version=notification_version or uuid7())
         )
 
     async def _load_file_record(
@@ -1734,8 +2389,13 @@ class SQLAlchemyAsyncIONotificationBackend(
             return [_stored_attachment(manager, join_row, join_row.file) for join_row in join_rows]
 
     async def delete_notification_attachment(
-        self, attachment_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
+        self,
+        attachment_id: int | str | uuid.UUID,
+        lock: asyncio.Lock | None = None,
+        *,
+        notification_version: str | None = None,
     ) -> None:
+        """See the sync twin."""
         async with self.session_manager() as session:
             async with session.begin():
                 try:
@@ -1745,7 +2405,9 @@ class SQLAlchemyAsyncIONotificationBackend(
                 if instance is not None:
                     notification_id = instance.notification_id
                     await session.delete(instance)
-                    await self._renew_version(session, notification_id)
+                    await self._renew_version(
+                        session, notification_id, _held_version(notification_version)
+                    )
 
     # ---------------------------------------------------------------------- persistence
 
@@ -1809,6 +2471,8 @@ class SQLAlchemyAsyncIONotificationBackend(
         tenant: str | None = None,
         requested_template_version: int | None = None,
         lock: asyncio.Lock | None = None,
+        *,
+        notification_version: str | None = None,
     ) -> Notification:
         async with self.session_manager() as session:
             notification_instance = self.notification_model_cls(
@@ -1825,6 +2489,7 @@ class SQLAlchemyAsyncIONotificationBackend(
                 adapter_extra_parameters=adapter_extra_parameters,
                 tenant=tenant,
                 requested_template_version=requested_template_version,
+                notification_version=_held_version(notification_version),
             )
             session.add(notification_instance)
             await session.flush()
@@ -1834,9 +2499,12 @@ class SQLAlchemyAsyncIONotificationBackend(
 
         stored_attachments: list[StoredAttachment] = []
         if attachments:
+            # See the sync twin: the returned notification carries the token the row ends on.
+            attachment_version = _held_version(notification_version)
             stored_attachments = await self._store_attachments(
-                attachments, notification_instance.id
+                attachments, notification_instance.id, attachment_version
             )
+            notification_instance.notification_version = attachment_version
         return _user_notification_from_orm(notification_instance, stored_attachments)
 
     async def persist_one_off_notification(
@@ -1857,6 +2525,8 @@ class SQLAlchemyAsyncIONotificationBackend(
         tenant: str | None = None,
         requested_template_version: int | None = None,
         lock: asyncio.Lock | None = None,
+        *,
+        notification_version: str | None = None,
     ) -> OneOffNotification:
         async with self.session_manager() as session:
             notification_instance = self.notification_model_cls(
@@ -1876,6 +2546,7 @@ class SQLAlchemyAsyncIONotificationBackend(
                 adapter_extra_parameters=adapter_extra_parameters,
                 tenant=tenant,
                 requested_template_version=requested_template_version,
+                notification_version=_held_version(notification_version),
             )
             session.add(notification_instance)
             await session.flush()
@@ -1885,9 +2556,12 @@ class SQLAlchemyAsyncIONotificationBackend(
 
         stored_attachments: list[StoredAttachment] = []
         if attachments:
+            # See the sync twin: the returned notification carries the token the row ends on.
+            attachment_version = _held_version(notification_version)
             stored_attachments = await self._store_attachments(
-                attachments, notification_instance.id
+                attachments, notification_instance.id, attachment_version
             )
+            notification_instance.notification_version = attachment_version
         return _one_off_notification_from_orm(notification_instance, stored_attachments)
 
     async def persist_notification_update(
@@ -1895,12 +2569,18 @@ class SQLAlchemyAsyncIONotificationBackend(
         notification_id: int | str | uuid.UUID,
         update_data: UpdateNotificationKwargs,
         lock: asyncio.Lock | None = None,
+        *,
+        notification_version: str | None = None,
     ) -> Notification | OneOffNotification:
         update_values = dict(update_data)
         attachments = cast("list[StoredAttachment] | None", update_values.pop("attachments", None))
 
+        given = _given_version(notification_version)
         async with self.session_manager() as session:
-            if update_values:
+            if not update_values and not attachments and given is not None:
+                await self._stamp_version(session, notification_id, given)
+            # A given token is a write on its own: the row has to end on it.
+            elif update_values or given is not None:
                 records_updated = _rowcount(
                     await session.execute(
                         update(self.notification_model_cls)
@@ -1918,7 +2598,9 @@ class SQLAlchemyAsyncIONotificationBackend(
                                     getattr(self.notification_model_cls, k): v
                                     for k, v in update_values.items()
                                 },
-                                self.notification_model_cls.notification_version: uuid7(),
+                                self.notification_model_cls.notification_version: (
+                                    _held_version(notification_version)
+                                ),
                             }
                         )
                     )
@@ -1947,37 +2629,73 @@ class SQLAlchemyAsyncIONotificationBackend(
                     )
 
         if attachments:
-            await self._attach_stored_attachments(notification_id, attachments)
+            await self._attach_stored_attachments(
+                notification_id, attachments, _held_version(notification_version)
+            )
 
         return await self.get_notification(notification_id)
 
+    async def _stamp_version(
+        self, session: AsyncSession, notification_id: int | str | uuid.UUID, token: uuid.UUID
+    ) -> None:
+        """The token-only write, in any status and keeping ``updated``; see the sync twin."""
+        model = self.notification_model_cls
+        stamped = _rowcount(
+            await session.execute(
+                update(model)
+                .where(model.id == notification_id)
+                .values(notification_version=token, updated=model.updated)
+                .execution_options(synchronize_session=False)
+            )
+        )
+        await session.commit()
+        if stamped == 0:
+            raise NotificationUpdateError(
+                f"Failed to update notification {notification_id}: it does not exist"
+            )
+
     async def mark_pending_as_sent(
-        self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
+        self,
+        notification_id: int | str | uuid.UUID,
+        lock: asyncio.Lock | None = None,
+        *,
+        notification_version: str | None = None,
     ) -> Notification | OneOffNotification:
         return await self._update_notification_status(
             notification_id,
             [NotificationStatus.PENDING_SEND.value],
             NotificationStatus.SENT.value,
             extra_values={"sent_at": _utcnow()},
+            notification_version=notification_version,
         )
 
     async def mark_pending_as_failed(
-        self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
+        self,
+        notification_id: int | str | uuid.UUID,
+        lock: asyncio.Lock | None = None,
+        *,
+        notification_version: str | None = None,
     ) -> Notification | OneOffNotification:
         return await self._update_notification_status(
             notification_id,
             [NotificationStatus.PENDING_SEND.value],
             NotificationStatus.FAILED.value,
+            notification_version=notification_version,
         )
 
     async def mark_sent_as_read(
-        self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
+        self,
+        notification_id: int | str | uuid.UUID,
+        lock: asyncio.Lock | None = None,
+        *,
+        notification_version: str | None = None,
     ) -> Notification | OneOffNotification:
         return await self._update_notification_status(
             notification_id,
             [NotificationStatus.SENT.value],
             NotificationStatus.READ.value,
             extra_values={"read_at": _utcnow()},
+            notification_version=notification_version,
         )
 
     async def mark_sent_as_read_bulk(
@@ -1985,10 +2703,14 @@ class SQLAlchemyAsyncIONotificationBackend(
         notification_ids: Iterable[int | str | uuid.UUID],
         user_id: int | str | uuid.UUID | None = None,
         lock: asyncio.Lock | None = None,
+        *,
+        notification_versions: Mapping[int | str | uuid.UUID, str] | None = None,
     ) -> Iterable[Notification]:
+        """See the sync twin, ``notification_versions`` included."""
         ids = list(notification_ids)
         if not ids:
             return []
+        held = _held_versions_by_id(self.notification_model_cls, notification_versions)
 
         base_filters = [self.notification_model_cls.id.in_(ids)]
         if user_id is not None:
@@ -2000,19 +2722,34 @@ class SQLAlchemyAsyncIONotificationBackend(
                 == user_id
             )
 
+        model = self.notification_model_cls
         async with self.session_manager() as session:
-            await session.execute(
-                update(self.notification_model_cls)
-                .where(
-                    *base_filters,
-                    self.notification_model_cls.status == NotificationStatus.SENT.value,
+            if held:
+                # Before the UPDATE below, so it reaches only the rows that were READ already.
+                await session.execute(
+                    update(model)
+                    .where(
+                        *base_filters,
+                        model.id.in_(list(held)),
+                        model.status == NotificationStatus.READ.value,
+                    )
+                    .values(
+                        notification_version=_bulk_version_value(model, held, uuid7()),
+                        updated=model.updated,
+                    )
+                    .execution_options(synchronize_session=False)
                 )
-                # See the sync twin: one statement, one new token for every row it reads.
+            await session.execute(
+                update(model)
+                .where(*base_filters, model.status == NotificationStatus.SENT.value)
+                # See the sync twin: one statement, one new token for every row it reads
+                # without a held one.
                 .values(
                     status=NotificationStatus.READ.value,
                     read_at=_utcnow(),
-                    notification_version=uuid7(),
+                    notification_version=_bulk_version_value(model, held, uuid7()),
                 )
+                .execution_options(synchronize_session=False)
             )
             await session.commit()
 
@@ -2037,7 +2774,11 @@ class SQLAlchemyAsyncIONotificationBackend(
         return await self._serialize_many_user(list(read_rows))
 
     async def cancel_notification(
-        self, notification_id: int | str | uuid.UUID, lock: asyncio.Lock | None = None
+        self,
+        notification_id: int | str | uuid.UUID,
+        lock: asyncio.Lock | None = None,
+        *,
+        notification_version: str | None = None,
     ) -> None:
         async with self.session_manager() as session:
             records_updated = _rowcount(
@@ -2050,7 +2791,7 @@ class SQLAlchemyAsyncIONotificationBackend(
                     .values(
                         {
                             "status": NotificationStatus.CANCELLED.value,
-                            "notification_version": uuid7(),
+                            "notification_version": _held_version(notification_version),
                         }
                     )
                 )
@@ -2067,6 +2808,7 @@ class SQLAlchemyAsyncIONotificationBackend(
         *,
         template_version: int | None = None,
         expected_version: str | None = None,
+        notification_version: str | None = None,
     ) -> Notification | OneOffNotification:
         """Put a FAILED or CANCELLED notification back into PENDING_SEND, in one conditional
         UPDATE. See the sync twin for the WHERE clause and the refusals."""
@@ -2075,7 +2817,7 @@ class SQLAlchemyAsyncIONotificationBackend(
         values: dict = {
             "status": NotificationStatus.PENDING_SEND.value,
             "sent_at": None,
-            "notification_version": uuid7(),
+            "notification_version": _held_version(notification_version),
         }
         if send_after is not UNSET:
             values["send_after"] = send_after
@@ -2122,6 +2864,7 @@ class SQLAlchemyAsyncIONotificationBackend(
         *,
         expected_version: str | None = None,
         lock: asyncio.Lock | None = None,
+        notification_version: str | None = None,
     ) -> Notification | OneOffNotification:
         """Pin a notification to ``template_version`` in one conditional UPDATE. See the sync
         twin for the WHERE clause and the refusals."""
@@ -2146,7 +2889,7 @@ class SQLAlchemyAsyncIONotificationBackend(
                         .where(*conditions)
                         .values(
                             requested_template_version=template_version,
-                            notification_version=uuid7(),
+                            notification_version=_held_version(notification_version),
                         )
                     )
                 )
@@ -2166,6 +2909,19 @@ class SQLAlchemyAsyncIONotificationBackend(
                     if current.requested_template_version != template_version:
                         raise _changed_error("repin", notification_id)
                     session.expunge(current)
+                    held = _held_version(notification_version)
+                    if (
+                        _given_version(notification_version) is not None
+                        and current.notification_version != held
+                    ):
+                        held_rows = _rowcount(
+                            await session.execute(
+                                _hold_repin_version(model, notification_id, current, held)
+                            )
+                        )
+                        if held_rows == 0:
+                            raise _changed_error("repin", notification_id)
+                        current.notification_version = held
                     unchanged = current
                 else:
                     unchanged = None
@@ -2198,8 +2954,12 @@ class SQLAlchemyAsyncIONotificationBackend(
         expected_current_statuses: list[str],
         new_status: str,
         extra_values: dict | None = None,
+        notification_version: str | None = None,
     ) -> Notification | OneOffNotification:
-        values: dict = {"status": new_status, "notification_version": uuid7()}
+        values: dict = {
+            "status": new_status,
+            "notification_version": _held_version(notification_version),
+        }
         if extra_values:
             values.update(extra_values)
         async with self.session_manager() as session:
@@ -2477,6 +3237,8 @@ class SQLAlchemyAsyncIONotificationBackend(
         context: dict,
         adapter_import_str: str,
         lock: asyncio.Lock | None = None,
+        *,
+        notification_version: str | None = None,
     ) -> None:
         async with self.session_manager() as session:
             await session.execute(
@@ -2485,7 +3247,7 @@ class SQLAlchemyAsyncIONotificationBackend(
                 .values(
                     context_used=context,
                     adapter_used=adapter_import_str,
-                    notification_version=uuid7(),
+                    notification_version=_held_version(notification_version),
                 )
             )
             await session.commit()
@@ -2495,12 +3257,17 @@ class SQLAlchemyAsyncIONotificationBackend(
         notification_id: int | str | uuid.UUID,
         git_commit_sha: str,
         lock: asyncio.Lock | None = None,
+        *,
+        notification_version: str | None = None,
     ) -> None:
         async with self.session_manager() as session:
             await session.execute(
                 update(self.notification_model_cls)
                 .where(self.notification_model_cls.id == notification_id)
-                .values(git_commit_sha=git_commit_sha, notification_version=uuid7())
+                .values(
+                    git_commit_sha=git_commit_sha,
+                    notification_version=_held_version(notification_version),
+                )
             )
             await session.commit()
 
@@ -2509,12 +3276,161 @@ class SQLAlchemyAsyncIONotificationBackend(
         notification_id: int | str | uuid.UUID,
         template_version: int,
         lock: asyncio.Lock | None = None,
+        *,
+        notification_version: str | None = None,
     ) -> None:
         # See the sync twin.
         async with self.session_manager() as session:
             await session.execute(
                 update(self.notification_model_cls)
                 .where(self.notification_model_cls.id == notification_id)
-                .values(used_template_version=template_version, notification_version=uuid7())
+                .values(
+                    used_template_version=template_version,
+                    notification_version=_held_version(notification_version),
+                )
             )
             await session.commit()
+
+    # ---------------------------------------------------------------------- replication
+
+    async def apply_replication_snapshot_if_newer(
+        self, snapshot: Notification | OneOffNotification
+    ) -> ApplyResult:
+        """Upsert the primary's snapshot under its own id, unless this backend's row is newer.
+
+        See the sync twin for the conditional UPDATE, the ``superseded`` decline, the insert in a
+        savepoint that loses a race to a concurrent apply gracefully, the attachment
+        reconciliation (which assumes attachment storage shared with the primary and never
+        touches bytes), the token taken last, the refusals, and ``SnapshotApplyDatabaseError``
+        in place of any other database error. All of it runs in one transaction.
+        """
+        model = self.notification_model_cls
+        keys = _snapshot_keys(model, snapshot)
+        if isinstance(keys, ApplyResult):
+            return keys
+        notification_id, user_id = keys
+        try:
+            return await self._apply_snapshot(snapshot, notification_id, user_id)
+        except DBAPIError as error:
+            failure = _snapshot_apply_failed(snapshot, error)
+        # See the sync twin: raised outside the ``except``, with no cause and no context.
+        raise failure from None
+
+    async def _apply_snapshot(
+        self,
+        snapshot: Notification | OneOffNotification,
+        notification_id: object,
+        user_id: object,
+    ) -> ApplyResult:
+        model = self.notification_model_cls
+        values = _snapshot_values(model, snapshot, user_id)
+        token = _held_version(snapshot.notification_version)
+
+        async with self.session_manager() as session:
+            async with session.begin():
+                refreshed = _rowcount(
+                    await session.execute(
+                        _snapshot_update(model, notification_id, snapshot, values)
+                    )
+                )
+                if refreshed == 0:
+                    if await self._snapshot_row_exists(session, notification_id):
+                        return _newer_here(snapshot)
+                    inserted = await self._insert_snapshot_row(
+                        session,
+                        notification_id,
+                        model(id=notification_id, notification_version=token, **values),
+                    )
+                    if not inserted:
+                        # Another apply inserted the row first: newer-wins against it.
+                        refreshed = _rowcount(
+                            await session.execute(
+                                _snapshot_update(model, notification_id, snapshot, values)
+                            )
+                        )
+                        if refreshed == 0:
+                            return _newer_here(snapshot)
+                await self._reconcile_snapshot_attachments(
+                    session, notification_id, snapshot.attachments
+                )
+                # Last, keeping ``updated``: see the sync twin.
+                await session.execute(
+                    update(model)
+                    .where(model.id == notification_id)
+                    .values(notification_version=token, updated=model.updated)
+                    .execution_options(synchronize_session=False)
+                )
+        return ApplyResult(applied=True)
+
+    async def _snapshot_row_exists(self, session: AsyncSession, notification_id: object) -> bool:
+        model = self.notification_model_cls
+        return (
+            await session.execute(select(model.id).where(model.id == notification_id))
+        ).one_or_none() is not None
+
+    async def _insert_snapshot_row(
+        self, session: AsyncSession, notification_id: object, row: "NotificationModel"
+    ) -> bool:
+        """See the sync twin."""
+        try:
+            async with session.begin_nested():
+                session.add(row)
+                await session.flush()
+        except IntegrityError:
+            if await self._snapshot_row_exists(session, notification_id):
+                return False
+            raise
+        return True
+
+    async def _reconcile_snapshot_attachments(
+        self,
+        session: AsyncSession,
+        notification_id: object,
+        attachments: list[StoredAttachment],
+    ) -> None:
+        """See the sync twin."""
+        join_rows = list(
+            (
+                await session.execute(
+                    select(NotificationAttachmentModel)
+                    .where(NotificationAttachmentModel.notification_id == notification_id)
+                    .order_by(NotificationAttachmentModel.id)
+                )
+            ).scalars()
+        )
+        for attachment in attachments:
+            record = (
+                (
+                    await session.execute(
+                        select(AttachmentFileRecordModel)
+                        .where(
+                            AttachmentFileRecordModel.checksum == attachment.checksum,
+                            AttachmentFileRecordModel.size == attachment.size,
+                        )
+                        .order_by(AttachmentFileRecordModel.id)
+                        .limit(1)
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if record is None:
+                record = _snapshot_file_record(attachment)
+                session.add(record)
+                await session.flush()
+            join_row = _take_join_row(join_rows, record.id, attachment)
+            if join_row is None:
+                session.add(
+                    NotificationAttachmentModel(
+                        notification_id=notification_id,
+                        file_id=record.id,
+                        description=attachment.description,
+                        is_inline=attachment.is_inline,
+                    )
+                )
+            else:
+                join_row.description = attachment.description
+                join_row.is_inline = attachment.is_inline
+        for stale in join_rows:
+            await session.delete(stale)
+        await session.flush()

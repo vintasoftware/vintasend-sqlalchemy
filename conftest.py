@@ -55,6 +55,40 @@ def setup_db(db_engine, db_filename):
     db_engine.dispose()
 
 
+@pytest.fixture(scope="session")
+def replica_db_filename(worker_id):
+    # A second database per worker, for the tests that replicate from the primary database
+    # above to a replica. Same models, same migrations, separate file.
+    return f"test_{worker_id}_replica.db"
+
+
+@pytest.fixture(scope="session")
+def replica_db_engine(replica_db_filename):
+    alembic_cfg = Config("alembic.ini")
+    alembic_cfg.set_main_option("sqlalchemy.url", f"sqlite:///{replica_db_filename}")
+    command.upgrade(alembic_cfg, "head")
+    engine = create_engine(f"sqlite:///{replica_db_filename}")
+
+    yield engine
+
+    engine.dispose()
+
+
+@pytest.fixture(scope="session")
+def replica_db_session(replica_db_engine) -> sessionmaker[Session]:
+    return sessionmaker(bind=replica_db_engine)
+
+
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
+async def replica_async_db_session(replica_db_engine, replica_db_filename):
+    # Depends on the sync engine only so the replica database is migrated first.
+    engine = create_async_engine(f"sqlite+aiosqlite:///{replica_db_filename}")
+
+    yield async_sessionmaker(bind=engine)
+
+    await engine.dispose()
+
+
 @pytest_asyncio.fixture(scope="session", autouse=True, loop_scope="session")
 async def setup_async_db(async_db_session):
     # The sync ``setup_db`` fixture already migrated this worker's shared file to head; the async

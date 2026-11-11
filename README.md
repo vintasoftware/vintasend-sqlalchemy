@@ -52,8 +52,9 @@ notification as well as a pending one; a `SENT` or `READ` one still raises
 ### Moving notifications safely
 
 Both backends implement every optional action vintasend 3.8.0 offers for moving notifications,
-and report all four in `get_action_capabilities()` (`repin.expectedVersion`,
-`requeue.expectedVersion`, `requeue.templateVersion`, `versions.filter`). They also evaluate the
+and report all five in `get_action_capabilities()` (`repin.expectedVersion`,
+`requeue.expectedVersion`, `requeue.templateVersion`, `versions.filter`,
+`writes.notificationVersion`). They also evaluate the
 presence filters `has_send_after` and `has_requested_template_version` (`IS NOT NULL` /
 `IS NULL`, negation included) and report them in `get_filter_capabilities()`.
 
@@ -86,6 +87,67 @@ or a Core `update()` against its table. A write that bypasses the model, such as
 another service writing to the same table, must set `notification_version` to a fresh UUID in the
 same statement (`vintasend.utils.uuid_utils.uuid7()`), or `expected_version` cannot see it.
 
+Every `Notification` / `OneOffNotification` the backends return carries the row's token in
+`notification_version` (`None` for a row inserted by a pre-3.8 instance during a rolling deploy),
+so a caller holding one can pass it as `expected_version` without listing.
+
+#### Replicas
+
+A second database can serve listings as a replica of the primary: give each backend a stable
+`backend_identifier` and pass the replica in `additional_backends`.
+
+```python
+primary = SQLAlchemyNotificationBackend(PrimarySession, Notification, backend_identifier="primary")
+replica = SQLAlchemyNotificationBackend(ReplicaSession, Notification, backend_identifier="replica")
+service = NotificationService(
+    notification_backend=primary,
+    additional_backends=[replica],
+    notification_adapters=[...],
+)
+
+for listed in service.filter_notification_versions(failed, 1, 100, backend_identifier="replica"):
+    service.requeue_notification(listed.id, expected_version=listed.version, send=False)
+```
+
+Moves always run on the primary, and the token a replica lists is the **primary's**. After every
+replicated write (requeue and repin included) the service hands the replica the primary's
+snapshot, and `apply_replication_snapshot_if_newer` upserts it under the primary's id in one
+transaction: a conditional `UPDATE` that only applies when the snapshot's `modified` is at least
+the row's (so a newer row is never overwritten), or an insert with the primary's `created` and
+`modified`, then the snapshot's `notification_version` as the row's token. Datetimes are compared
+and stored as naive UTC, so a snapshot whose `modified` carries another offset is still ordered by
+its instant. A row newer than the snapshot is declined as `superseded`, and the service replays
+nothing over it. The insert runs in a savepoint: if a concurrent apply inserts the same id first,
+the conditional `UPDATE` runs again against that row, newer-wins as before.
+
+A replica that declines a snapshot for any other reason has the write replayed through its own
+methods instead, with no token; the service then checks the row against the snapshot and, only
+when they match, stamps it with `persist_notification_update(id, {}, notification_version=...)`.
+That token-only write is accepted in any status, `SENT` and `READ` included, and changes nothing
+but the token (not `updated`); an update that changes anything else is still refused once a
+notification is delivered. If the replay or the stamp fails, the replica keeps a token of its own,
+which the primary refuses. Either way `get_backend_supported_action_capabilities("replica")`
+reports `versions.filter` and `writes.notificationVersion`.
+
+A replica lags its primary. A version listed from it before the latest write reached it is
+refused with reason `CHANGED`, and nothing is written; list again and retry.
+
+Snapshot apply copies attachment **metadata** only: each file is matched on the replica by
+`(checksum, size)` or recorded from the snapshot's `storage_identifiers`, and join rows are added
+and removed to match. The bytes are never read or copied, so both backends must use the same
+attachment storage (the same attachment manager configuration, e.g. one bucket or one shared
+`VINTASEND_ATTACHMENTS_PATH`).
+
+A snapshot whose id (or user id) this backend's column cannot hold, such as a UUID string for the
+integer primary key, is declined and nothing is written, so primary and replica should share an id
+type. Both databases need the same migrations, and the replica's `users` table must hold the users
+its rows point at where foreign keys are enforced.
+
+Any other database error while applying a snapshot (a foreign key, a `NOT NULL`, a lost
+connection) is raised as `SnapshotApplyDatabaseError`, a `NotificationError` whose message names
+the notification id and the error class only, with SQLAlchemy's original neither chained nor kept
+as context: its text lists the statement's parameters, which hold titles, recipients and contexts.
+
 ## Backends
 
 ```python
@@ -98,7 +160,7 @@ from vintasend_sqlalchemy.services.notification_backends.sqlalchemy_notification
 
 from myapp.models import Notification  # your GenericNotification subclass
 
-engine = create_engine("postgresql://...")
+engine = create_engine("postgresql://...", hide_parameters=True)
 Session = sessionmaker(bind=engine)
 
 backend = SQLAlchemyNotificationBackend(Session, Notification)
@@ -113,10 +175,16 @@ from vintasend_sqlalchemy.services.notification_backends.sqlalchemy_notification
     SQLAlchemyAsyncIONotificationBackend,
 )
 
-engine = create_async_engine("postgresql+asyncpg://...")
+engine = create_async_engine("postgresql+asyncpg://...", hide_parameters=True)
 Session = async_sessionmaker(bind=engine)
 backend = SQLAlchemyAsyncIONotificationBackend(Session, Notification)
 ```
+
+Create every engine a backend uses, primary and replicas alike, with `hide_parameters=True`.
+Without it, a database error from any write renders the statement's bound parameters into the
+exception text (`[parameters: ...]`), and a notification's parameters are its title, recipient
+and context, which then reach whatever logs the exception. Only snapshot apply wraps its errors
+itself; every other write raises SQLAlchemy's error as is.
 
 ## Attachments
 

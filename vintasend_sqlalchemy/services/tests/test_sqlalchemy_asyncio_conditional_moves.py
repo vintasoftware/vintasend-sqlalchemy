@@ -47,6 +47,7 @@ ALL_ACTIONS = {
     "requeue.expectedVersion": True,
     "requeue.templateVersion": True,
     "versions.filter": True,
+    "writes.notificationVersion": True,
 }
 PRESENCE_CAPABILITIES = {
     "fields.hasSendAfter": True,
