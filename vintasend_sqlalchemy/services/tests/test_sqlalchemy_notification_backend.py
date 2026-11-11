@@ -100,7 +100,7 @@ class SQLAlchemyNotificationBackendTestCase(TestCase):
             self.session, NotificationModel
         ).persist_notification_update(
             notification_id=notification.id,
-            updated_data=updated_data,
+            update_data=updated_data,
         )
 
         assert updated_notification.subject_template == "updated test subject"
@@ -481,7 +481,8 @@ class SQLAlchemyNotificationBackendTestCase(TestCase):
         SQLAlchemyNotificationBackend(self.session, NotificationModel).cancel_notification(
             notification.id
         )
-        with pytest.raises(NotificationNotFoundError):
-            SQLAlchemyNotificationBackend(self.session, NotificationModel).get_notification(
-                notification.id
-            )
+        # Kept and returned as CANCELLED, so it can be requeued.
+        cancelled = SQLAlchemyNotificationBackend(self.session, NotificationModel).get_notification(
+            notification.id
+        )
+        assert cancelled.status == NotificationStatus.CANCELLED.value
